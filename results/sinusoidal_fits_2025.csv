@@ -1,0 +1,6 @@
+moon,year,n_observations,n_nights,fit_type,offset_arcsec,amplitude_arcsec,period_days,period_error_days,phase_rad
+dione,2025,2,2,not fitted: insufficient data,,,,,
+enceladus,2025,2,2,not fitted: insufficient data,,,,,
+rhea,2025,3,3,not fitted: insufficient data,,,,,
+tethys,2025,4,4,not fitted: insufficient data,,,,,
+titan,2025,4,4,not fitted: insufficient data,,,,,
