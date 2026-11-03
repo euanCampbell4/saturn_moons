@@ -1,0 +1,6 @@
+moon,year,parent,n_observations,n_nights,status,a_arcsec,a_err_arcsec,b_arcsec,b_over_a,b_over_a_err,tilt_deg,psi_deg,psi_err_deg,period_days,period_err_days,phase_rad,chi2_red
+dione,2025,saturn,2,2,not fitted: insufficient data,,,,,,,,,,,,
+enceladus,2025,saturn,2,2,not fitted: insufficient data,,,,,,,,,,,,
+rhea,2025,saturn,3,3,not fitted: insufficient data,,,,,,,,,,,,
+tethys,2025,saturn,4,4,not fitted: insufficient data,,,,,,,,,,,,
+titan,2025,saturn,4,4,not fitted: insufficient data,,,,,,,,,,,,

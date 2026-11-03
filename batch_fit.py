@@ -68,6 +68,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 
+import orbit_fit
 
 # ============================================================
 # CONFIGURATION
@@ -992,6 +993,10 @@ def main():
     angular = calculate_angular_separations(centres)
 
     plot_angular_separations(angular)
+
+    orbit_fit.fit_and_plot_orbits(
+        angular, OUT_DIR, INITIAL_PERIODS, PARENT_BODY
+    )
 
     print("\nPipeline complete.")
 
