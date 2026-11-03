@@ -399,7 +399,7 @@ def plot_system_view(year_df, fits, parent, year, path):
     if not moons:
         return
 
-    fig, ax = plt.subplots(figsize=(11, 6))
+    fig, ax = plt.subplots(figsize=(15, 10))
     colours = plt.cm.tab10(np.arange(len(moons)) % 10)
 
     ax.plot(0, 0, "o", color="gold", mec="k", ms=14, zorder=5,
