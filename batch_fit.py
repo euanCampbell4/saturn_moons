@@ -25,20 +25,22 @@ Examples:
     triton_img0010_y.csv
 
 Relative-position CSV columns:
-    Data, Date, Time, CD1_1, CD1_2, CD2_1, CD2_2, dX, dY
+    Data, Date, Time, CD1_1, CD1_2, CD2_1, CD2_2, dX, dY, dZ, dSat
+    (optional: dZ = ephemeris distance to planet minus distance to moon;
+     dSat = distance Earth-to-planet; AU or km)
 
 Outputs
 -------
 results/centres.csv
 results/angular_separations.csv
 results/angular_separations_<year>.csv      one file per observing year
-results/sinusoidal_fits_<year>.csv          one file per observing year
-results/sinusoidal_fits.csv                 summary of the above (has a year column)
+results/orbit_fits_<year>.csv               one file per observing year
+results/orbit_fits.csv                      summary of the above (has a year column)
 results/plots/
-results/angular_plots/<year>/
+results/angular_plots/<year>/<moon>_orbit.png
 
 Each observing year is fitted completely on its own: data from different
-years are never combined in a sinusoidal fit.
+years are never combined in a fit.
 
 Run from the repository root:
     python batch_fit.py
@@ -66,9 +68,8 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, minimize_scalar
 
-import orbit_fit
 
 # ============================================================
 # CONFIGURATION
@@ -95,27 +96,58 @@ PARENT_BODY = {
     "triton": "neptune",
 }
 
-# Approximate orbital periods, in days, used as fit starting values.
-# The fit is constrained to +/- 50% of the listed value by default.
-INITIAL_PERIODS = {
-    "titan": 15.945,
-    "rhea": 4.518,
-    "tethys": 1.888,
-    "dione": 2.737,
-    "enceladus": 1.370,
-    "triton": 5.877,
-}
+# ---- Orbit fit settings -------------------------------------------------
+# No orbital period is assumed. The fit scans every period between
+# MIN_PERIOD_DAYS and MAX_PERIOD_SPAN_FACTOR x (the year's observing span).
+MIN_PERIOD_DAYS = 0.5
+MAX_PERIOD_SPAN_FACTOR = 3.0
+PERIOD_SCAN_OVERSAMPLE = 400      # scan steps per resolvable frequency interval
+                                  # (fine, because well-measured data has very narrow chi-squared dips)
 
-USE_PERIOD_PRIOR = True
+# Images closer together in time than this are averaged into one "visit",
+# because they are not independent measurements of the orbit.
+VISIT_GAP_MINUTES = 30.0
 
-# A yearly fit is attempted when a moon has at least this many observations
-# in that year.
-MIN_OBSERVATIONS_FOR_FIT = 6
+# A fit has 5 free parameters (period + 2 x 2 ellipse coefficients) and each
+# visit gives 2 numbers, so 4 visits is the bare mathematical minimum and
+# leaves almost no redundancy: with a free period the fit then simply picks
+# whichever period matches, and the answer is not trustworthy. 6 visits
+# (7 degrees of freedom) is the smallest number that gives a meaningful test.
+MIN_VISITS_FOR_FIT = 6
 
-# Images taken minutes apart on the same night are not independent
-# measurements of the orbit. A warning is printed when a yearly fit rests on
-# fewer distinct observing nights than this.
-MIN_NIGHTS_FOR_RELIABLE_FIT = 5
+# With dz as a third coordinate each visit gives 3 numbers, so fewer visits
+# are enough (6 linear parameters + period = 7 unknowns; 4 visits = 12 numbers).
+MIN_VISITS_WITH_DZ = 4
+
+# A competing period within this many "scale units" of chi-squared of the
+# best one is reported as not ruled out (ambiguous).
+ALIAS_DELTA_CHI2 = 9.0
+
+# Use the ephemeris depth offset dz as a third coordinate in the orbit fit
+# (needs dz and dSat in the CSV). The period then comes from sky positions
+# AND dz together, so it is partly informed by the ephemeris. Set False to
+# fit the period from the sky positions alone (dz is then only a check).
+USE_DZ_IN_FIT = True
+
+# Which orbit fit to run. False: the fit built into this file (linear period
+# scan, centred ellipse). True: the separate orbit_fit.py module (physical
+# ellipse model with tilt and orientation, plus system plots). Run only one,
+# because both write results/orbit_fits.csv.
+USE_ORBIT_FIT_MODULE = False
+
+N_BOOTSTRAP = 300                 # resamples used for the ellipse-axis errors
+
+# relative_positions.csv may contain two optional distance columns:
+#   dz    = (distance Earth-to-planet) - (distance Earth-to-moon), from an
+#           ephemeris. Positive means the moon is closer to Earth than its planet.
+#   dsat  = distance Earth-to-planet (e.g. JPL Horizons "delta"), used to turn
+#           arcseconds into km.
+# Units of both: "auto" treats values whose median magnitude is below 10 as AU
+# and larger values as km.
+DIST_UNIT = "auto"                # "auto", "au" or "km"
+
+# Used for the km conversion when the CSV has no dsat column (AU), else None.
+PLANET_DISTANCE_AU = None
 
 # Print additional diagnostics.
 VERBOSE = True
@@ -375,6 +407,32 @@ def load_relative_positions():
     for column in numeric_columns:
         df[column] = pd.to_numeric(df[column], errors="raise")
 
+    # Optional distance columns (see DIST_UNIT).
+    def to_km(column):
+        if column not in df.columns:
+            return pd.Series(np.nan, index=df.index)
+
+        values = pd.to_numeric(df[column], errors="coerce")
+        unit = DIST_UNIT.lower()
+
+        if unit == "auto":
+            unit = "au" if np.nanmedian(np.abs(values)) < 10 else "km"
+            print(f"{column} column interpreted as {unit.upper()} "
+                  f"(median |value| {np.nanmedian(np.abs(values)):.4g}); "
+                  "set DIST_UNIT to override.")
+
+        return values * 1.495978707e8 if unit == "au" else values
+
+    df["dz_km"] = to_km("dz")
+    df["dsat_km"] = to_km("dsat")
+
+    if df["dsat_km"].isna().all() and PLANET_DISTANCE_AU is not None:
+        df["dsat_km"] = PLANET_DISTANCE_AU * 1.495978707e8
+
+    if df["dsat_km"].isna().all():
+        print("Note: no dsat column or PLANET_DISTANCE_AU, so results are "
+              "in arcseconds only (no km).")
+
     if not np.isfinite(
         df[numeric_columns].to_numpy(dtype=float)
     ).all():
@@ -596,6 +654,14 @@ def calculate_angular_separations(centres):
 
     df["error_arcsec"] = errors
 
+    # Errors on sky_x and sky_y themselves (propagated through the CD matrix).
+    df["sky_x_err_arcsec"] = np.sqrt(
+        (cd[:, 0] * sx) ** 2 + (cd[:, 1] * sy) ** 2
+    )
+    df["sky_y_err_arcsec"] = np.sqrt(
+        (cd[:, 2] * sx) ** 2 + (cd[:, 3] * sy) ** 2
+    )
+
     # Make missing centroid matches visible.
     missing_moon = df["sigma_moon_x"].isna() | df["sigma_moon_y"].isna()
     missing_parent = (
@@ -636,123 +702,465 @@ def calculate_angular_separations(centres):
 
 
 # ============================================================
-# SINUSOIDAL FIT
+# ORBIT FIT: CENTRED ELLIPSE WITH A FREE PERIOD
 # ============================================================
-def sinusoid(t, offset, amplitude, period, phase):
-    return offset + amplitude * np.abs(np.sin(2 * np.pi * t / period + phase))
+#
+# Each moon's apparent path around its parent planet is an ellipse centred
+# on the planet. For ANY orientation, shape and phase, such a path can be
+# written
+#
+#     sky_x(t) = ax*sin(w t) + bx*cos(w t)
+#     sky_y(t) = ay*sin(w t) + by*cos(w t)           w = 2*pi/P
+#
+# For a trial period P this is an ordinary linear least-squares problem, so
+# the period is found by scanning a wide range of trial periods and keeping
+# the best one. Nothing about the orbit (plane direction, period, size) is
+# assumed in advance.
 
-def fit_sinusoid(t, y, errors, moon, label=None):
+ARCSEC_PER_RAD = 206264.80624709636
+
+
+def _basis(t, frequency):
+    omega = 2.0 * np.pi * frequency
+    return np.column_stack([np.sin(omega * t), np.cos(omega * t)])
+
+
+def _weighted_fit(design, x, y, wx, wy, z=None, wz=None):
+    """Weighted linear fit of x(t), y(t) (and z(t) if given) on the sin/cos basis.
+
+    Returns (chi2, coefficients_x, coefficients_y, coefficients_z or None).
     """
-    Fit an empirical sinusoid.
+    total = 0.0
+    coefficients = []
 
-    Returns:
-        (t0, parameters, covariance), or None if the data
-        do not support a reliable fit.
+    series = [(x, wx), (y, wy)]
+    if z is not None:
+        series.append((z, wz))
 
-    At least MIN_OBSERVATIONS_FOR_FIT observations spanning a non-zero
-    time interval are required. This is a practical minimum, not a
-    guarantee that the fitted period is well constrained.
+    for values, weights in series:
+        root = np.sqrt(weights)
+        coeff, *_ = np.linalg.lstsq(
+            design * root[:, None], values * root, rcond=None
+        )
+        residual = (values - design @ coeff) * root
+        total += float(np.sum(residual ** 2))
+        coefficients.append(coeff)
 
-    `label` is only used in printed messages (for example "titan 2026").
+    coeff_z = coefficients[2] if z is not None else None
+    return total, coefficients[0], coefficients[1], coeff_z
+
+
+def _axes_3d(coeff_x, coeff_y, coeff_z):
+    """Semi-major and semi-minor axes of the 3D orbit ellipse."""
+    matrix = np.array([coeff_x, coeff_y, coeff_z])
+    singular = np.linalg.svd(matrix, compute_uv=False)
+    return singular[0], singular[1]
+
+
+def _ellipse_axes(coeff_x, coeff_y):
+    """Semi-axes and orientation of the ellipse defined by the coefficients."""
+    matrix = np.array([
+        [coeff_x[0], coeff_x[1]],
+        [coeff_y[0], coeff_y[1]],
+    ])
+    u, singular, _ = np.linalg.svd(matrix)
+    major, minor = singular
+
+    # Position angle of the major axis, measured from the +sky_y axis
+    # towards the +sky_x axis (north through east, if sky_y is north and
+    # sky_x is east), folded into 0-180 degrees.
+    angle = np.degrees(np.arctan2(u[0, 0], u[1, 0])) % 180.0
+
+    return major, minor, angle
+
+
+def combine_into_visits(group):
+    """
+    Average images taken close together in time into one point per visit.
+
+    Images a few seconds or minutes apart are not independent measurements
+    of the orbit, so they are combined (weighted by their uncertainties when
+    these are available) before fitting.
+    """
+    group = group.sort_values("datetime")
+
+    gap_minutes = (
+        group["datetime"].diff().dt.total_seconds().div(60.0).fillna(np.inf)
+    )
+    visit_id = (gap_minutes > VISIT_GAP_MINUTES).cumsum()
+
+    rows = []
+
+    for _, visit in group.groupby(visit_id):
+        first = visit["datetime"].iloc[0]
+        mean_time = first + (visit["datetime"] - first).mean()
+
+        record = {"datetime": mean_time, "n_images": len(visit)}
+
+        for axis in ("x", "y"):
+            values = visit[f"sky_{axis}_arcsec"].to_numpy(dtype=float)
+            errors = visit[f"sky_{axis}_err_arcsec"].to_numpy(dtype=float)
+
+            if np.all(np.isfinite(errors)) and np.all(errors > 0):
+                weights = 1.0 / errors ** 2
+                record[axis] = float(np.sum(weights * values) / np.sum(weights))
+                record[f"{axis}_err"] = float(1.0 / np.sqrt(np.sum(weights)))
+            else:
+                record[axis] = float(np.mean(values))
+                record[f"{axis}_err"] = np.nan
+
+        for column in ("dz_km", "dsat_km"):
+            values = visit[column].to_numpy(dtype=float)
+            record[column] = (
+                float(values[np.isfinite(values)].mean())
+                if np.isfinite(values).any() else np.nan
+            )
+
+        rows.append(record)
+
+    return pd.DataFrame(rows)
+
+
+def dz_consistency(visits, t, frequency):
+    """
+    Check the fitted period against the ephemeris depth offset dz.
+
+    The period comes from the sky positions alone. A moon on a (nearly)
+    circular orbit should also have dz varying as a sinusoid at that same
+    period. This fits dz at the sky-derived period and reports how well it
+    matches: a small ratio means the period is consistent with the
+    ephemeris depth. dz comes from an ephemeris, so this is a check, not an
+    independent measurement.
+    """
+    dz = visits["dz_km"].to_numpy(dtype=float)
+    good = np.isfinite(dz)
+
+    empty = {"dz_amplitude_km": np.nan, "dz_rms_km": np.nan,
+             "dz_rms_over_amplitude": np.nan}
+
+    if good.sum() < 4:
+        return empty
+
+    design = _basis(t[good], frequency)
+    coeff, *_ = np.linalg.lstsq(design, dz[good], rcond=None)
+    residual = dz[good] - design @ coeff
+    amplitude = float(np.hypot(*coeff))
+    rms = float(np.sqrt(np.mean(residual ** 2)))
+
+    return {
+        "dz_amplitude_km": amplitude,
+        "dz_rms_km": rms,
+        "dz_rms_over_amplitude": rms / amplitude if amplitude > 0 else np.nan,
+    }
+
+
+def fit_orbit_ellipse(t, x, y, sx, sy, z=None, sz=None):
+    """
+    Fit a centred ellipse with a free period.
+
+    t         times in days
+    x, y      sky offsets from the parent planet (arcsec)
+    sx, sy    1-sigma uncertainties (arcsec); NaN if unknown
+    z, sz     optional depth offset and its uncertainty, expressed in the
+              same angular units as x and y (dz converted with the planet's
+              distance). When given, the period is fitted to all three
+              coordinates together.
+
+    Returns a dictionary, or None when there are too few visits.
     """
 
-    label = label or moon
+    n = len(t)
 
-    good = np.isfinite(t) & np.isfinite(y)
-    t = np.asarray(t)[good]
-    y = np.asarray(y)[good]
-    errors = np.asarray(errors)[good]
-
-    if len(y) < MIN_OBSERVATIONS_FOR_FIT or np.ptp(t) <= 0:
+    if n < (MIN_VISITS_WITH_DZ if z is not None else MIN_VISITS_FOR_FIT):
         return None
 
-    t0 = t.min()
-    t = t - t0
-    span = np.ptp(t)
+    span = float(np.ptp(t))
 
-    period_guess = INITIAL_PERIODS.get(moon, span / 2)
+    if span <= 0:
+        return None
 
-    if span < period_guess:
-        print(
-            f"Warning: {label}: the observations span only "
-            f"{span:.2f} days, shorter than the starting period "
-            f"of {period_guess:.3f} days. The fit may be uncertain."
-        )
+    # 4 (or 6, with z) linear parameters + the period.
+    n_coords = 3 if z is not None else 2
+    n_linear = 2 * n_coords
+    dof = n_coords * n - n_linear - 1
 
-    amplitude_guess = max(
-        (np.max(y) - np.min(y)) / 2,
-        1e-5,
-    )
-    offset_guess = np.mean(y)
-
-    if USE_PERIOD_PRIOR:
-        minimum_period = max(0.05, period_guess * 0.5)
-        maximum_period = period_guess * 1.5
-    else:
-        minimum_period = max(0.05, span / 10)
-        maximum_period = max(minimum_period * 1.01, span * 2)
+    if dof <= 0:
+        return None
 
     weighted = (
-        len(errors) == len(y)
-        and np.all(np.isfinite(errors))
-        and np.all(errors > 0)
+        np.all(np.isfinite(sx)) and np.all(np.isfinite(sy))
+        and np.all(sx > 0) and np.all(sy > 0)
     )
 
-    fit_options = {}
+    wx = 1.0 / sx ** 2 if weighted else np.ones(n)
+    wy = 1.0 / sy ** 2 if weighted else np.ones(n)
 
-    if weighted:
-        fit_options["sigma"] = errors
-        fit_options["absolute_sigma"] = True
+    if z is not None:
+        wz = 1.0 / sz ** 2 if weighted else np.ones(n)
+    else:
+        wz = None
 
-    try:
-        parameters, covariance = curve_fit(
-            sinusoid,
-            t,
-            y,
-            p0=[
-                offset_guess,
-                amplitude_guess,
-                period_guess,
-                0.0,
-            ],
-            bounds=(
-                [
-                    -np.inf, 0,
-                    minimum_period, -2 * np.pi,
-                ],
-                [
-                    np.inf, np.inf,
-                    maximum_period, 2 * np.pi,
-                ],
-            ),
-            maxfev=50000,
-            **fit_options,
-        )
+    # Scan evenly in frequency, which is how aliases are spaced.
+    f_min = 1.0 / (MAX_PERIOD_SPAN_FACTOR * span)
+    f_max = 1.0 / MIN_PERIOD_DAYS
+    step = 1.0 / (PERIOD_SCAN_OVERSAMPLE * span)
 
-        return t0, parameters, covariance
+    freqs = np.arange(f_min, f_max + step, step)
+    chi2 = np.array([
+        _weighted_fit(_basis(t, f), x, y, wx, wy, z, wz)[0] for f in freqs
+    ])
 
-    except (RuntimeError, ValueError) as error:
-        print(f"Sinusoidal fit failed for {label}: {error}")
+    # Distinct local minima, best first.
+    padded = np.r_[np.inf, chi2, np.inf]
+    minima = [
+        i for i in range(len(chi2))
+        if padded[i + 1] < padded[i] and padded[i + 1] <= padded[i + 2]
+    ]
+
+    if not minima:
         return None
 
+    minima.sort(key=lambda i: chi2[i])
 
-def plot_angular_separations(df):
+    def refine(index):
+        lower = freqs[max(index - 1, 0)]
+        upper = freqs[min(index + 1, len(freqs) - 1)]
+        result = minimize_scalar(
+            lambda f: _weighted_fit(_basis(t, f), x, y, wx, wy, z, wz)[0],
+            bounds=(lower, upper),
+            method="bounded",
+        )
+        return float(result.fun), float(result.x), index
+
+    # Refine each of the best dips before comparing them: a dip that looks
+    # slightly worse on the grid can be exactly as good once refined.
+    candidates = sorted(refine(index) for index in minima[:12])
+    _, f_best, best = candidates[0]
+    chi2_best, coeff_x, coeff_y, coeff_z = _weighted_fit(
+        _basis(t, f_best), x, y, wx, wy, z, wz
+    )
+
+    # Scale: the residual variance per degree of freedom.
+    # With trusted per-point errors the noise scale is at least 1, so a lucky
+    # tiny chi-squared cannot make every alias look unlikely.
+    scale = max(chi2_best / dof, 1.0 if weighted else 1e-12)
+
+    # Period uncertainty: the range over which chi2 rises by one scale unit.
+    left = best
+    while left > 0 and chi2[left - 1] <= chi2_best + scale:
+        left -= 1
+
+    right = best
+    while right < len(freqs) - 1 and chi2[right + 1] <= chi2_best + scale:
+        right += 1
+
+    period = 1.0 / f_best
+    period_error = max(
+        0.5 * (1.0 / freqs[left] - 1.0 / freqs[right]),
+        0.5 * (1.0 / (f_best - step / 2) - 1.0 / (f_best + step / 2)),
+    )
+
+    # How distinct is the best period from its aliases?
+    alternatives = []
+
+    for chi2_c, f_c, _ in candidates[1:]:
+        delta = (chi2_c - chi2_best) / scale
+
+        if delta < ALIAS_DELTA_CHI2:
+            alternatives.append((1.0 / f_c, delta))
+
+    if len(candidates) > 1:
+        next_period = 1.0 / candidates[1][1]
+        next_delta = (candidates[1][0] - chi2_best) / scale
+    else:
+        next_period, next_delta = np.nan, np.inf
+
+    at_limit = best in (0, len(freqs) - 1)
+
+    if at_limit:
+        status = "at edge of search range"
+    elif alternatives:
+        status = "ambiguous"
+    else:
+        status = "unique"
+
+    # Ellipse size, shape and orientation.
+    major, minor, angle = _ellipse_axes(coeff_x, coeff_y)
+
+    # Uncertainty on the semi-axes by resampling at the best period.
+    design = _basis(t, f_best)
+    model_x = design @ coeff_x
+    model_y = design @ coeff_y
+    sigma_x = np.sqrt(scale / wx)
+    sigma_y = np.sqrt(scale / wy)
+
+    if z is not None:
+        model_z = design @ coeff_z
+        sigma_z = np.sqrt(scale / wz)
+        major3d, minor3d = _axes_3d(coeff_x, coeff_y, coeff_z)
+    else:
+        model_z = sigma_z = None
+        major3d = minor3d = np.nan
+
+    rng = np.random.default_rng(12345)
+    majors, minors, majors3d = [], [], []
+
+    for _ in range(N_BOOTSTRAP):
+        _, cx, cy, cz = _weighted_fit(
+            design,
+            model_x + rng.normal(0.0, sigma_x),
+            model_y + rng.normal(0.0, sigma_y),
+            wx,
+            wy,
+            None if z is None else model_z + rng.normal(0.0, sigma_z),
+            wz,
+        )
+        a_sim, b_sim, _ = _ellipse_axes(cx, cy)
+        majors.append(a_sim)
+        minors.append(b_sim)
+
+        if z is not None:
+            majors3d.append(_axes_3d(cx, cy, cz)[0])
+
+    squares = np.sum((x - model_x) ** 2) + np.sum((y - model_y) ** 2)
+    if z is not None:
+        squares += np.sum((z - model_z) ** 2)
+
+    rms = float(np.sqrt(squares / (n_coords * n)))
+
+    return {
+        "weighted": bool(weighted),
+        "period": period,
+        "period_error": period_error,
+        "status": status,
+        "alternatives": alternatives,
+        "next_period": next_period,
+        "next_delta": next_delta,
+        "major": major,
+        "major_error": float(np.std(majors)),
+        "used_dz": z is not None,
+        "major3d": float(major3d),
+        "minor3d": float(minor3d),
+        "major3d_error": float(np.std(majors3d)) if majors3d else np.nan,
+        "minor": minor,
+        "minor_error": float(np.std(minors)),
+        "angle": angle,
+        "rms": rms,
+        "chi2": chi2_best,
+        "dof": dof,
+        "coeff_x": coeff_x,
+        "coeff_y": coeff_y,
+        "frequency": f_best,
+        "freqs": freqs,
+        "scan_chi2": chi2,
+        "scale": scale,
+    }
+
+
+def _plot_orbit(path, moon, year, origin, visits, t, result):
+    """Sky-plane path, x(t) and y(t), and the period scan."""
+
+    x = visits["x"].to_numpy(dtype=float)
+    y = visits["y"].to_numpy(dtype=float)
+    sx = visits["x_err"].to_numpy(dtype=float)
+    sy = visits["y_err"].to_numpy(dtype=float)
+
+    fig = plt.figure(figsize=(11, 8))
+    grid = fig.add_gridspec(2, 2)
+    ax_sky = fig.add_subplot(grid[0, 0])
+    ax_scan = fig.add_subplot(grid[0, 1])
+    ax_time = fig.add_subplot(grid[1, :])
+
+    ax_sky.errorbar(
+        x, y,
+        xerr=np.where(np.isfinite(sx), sx, 0.0),
+        yerr=np.where(np.isfinite(sy), sy, 0.0),
+        fmt="o", capsize=2, label="visits",
+    )
+    ax_sky.plot(0, 0, "k+", markersize=12, label="parent planet")
+
+    ax_time.errorbar(
+        t, x,
+        yerr=np.where(np.isfinite(sx), sx, 0.0),
+        fmt="o", capsize=2, label="sky_x",
+    )
+    ax_time.errorbar(
+        t, y,
+        yerr=np.where(np.isfinite(sy), sy, 0.0),
+        fmt="s", capsize=2, label="sky_y",
+    )
+
+    if result is not None:
+        tau = np.linspace(0, 2 * np.pi, 400)
+        ax_sky.plot(
+            result["coeff_x"][0] * np.sin(tau) + result["coeff_x"][1] * np.cos(tau),
+            result["coeff_y"][0] * np.sin(tau) + result["coeff_y"][1] * np.cos(tau),
+            "-", label="fitted ellipse",
+        )
+
+        t_line = np.linspace(0, max(float(np.ptp(t)), result["period"]), 800)
+        design = _basis(t_line, result["frequency"])
+        ax_time.plot(t_line, design @ result["coeff_x"], "-", color="C0", alpha=0.7)
+        ax_time.plot(t_line, design @ result["coeff_y"], "-", color="C1", alpha=0.7)
+
+        periods = 1.0 / result["freqs"]
+        ax_scan.semilogy(periods, result["scan_chi2"], "-")
+        ax_scan.axhline(
+            result["chi2"] + ALIAS_DELTA_CHI2 * result["scale"],
+            color="gray", linestyle="--",
+            label="aliases below this line are not ruled out",
+        )
+        ax_scan.axvline(result["period"], color="r", linestyle=":")
+        ax_scan.set_xscale("log")
+        ax_scan.set_xlabel("trial period (days)")
+        ax_scan.set_ylabel("chi-squared (or residual sum of squares)")
+        ax_scan.set_title(
+            f"Period scan: best {result['period']:.3f} "
+            f"+/- {result['period_error']:.3f} d ({result['status']})",
+            fontsize=10,
+        )
+        ax_scan.legend(fontsize=7)
+    else:
+        ax_scan.axis("off")
+        ax_sky.text(
+            0.03, 0.97,
+            f"Not fitted: fewer than {MIN_VISITS_FOR_FIT} separate visits.",
+            transform=ax_sky.transAxes, va="top", fontsize=9,
+        )
+
+    ax_sky.set_xlabel("sky_x (arcsec)")
+    ax_sky.set_ylabel("sky_y (arcsec)")
+    ax_sky.set_aspect("equal", adjustable="datalim")
+    ax_sky.grid(True, alpha=0.3)
+    ax_sky.legend(fontsize=7)
+    ax_sky.set_title("Path on the sky", fontsize=10)
+
+    ax_time.set_xlabel(f"Days since {origin:%Y-%m-%d %H:%M}")
+    ax_time.set_ylabel("Offset from parent planet (arcsec)")
+    ax_time.grid(True, alpha=0.3)
+    ax_time.legend(fontsize=8)
+
+    parent = PARENT_BODY.get(moon, "parent planet").capitalize()
+    fig.suptitle(f"{moon.capitalize()} relative to {parent} ({year})")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def fit_orbits_by_year(df):
     """
-    Fit and plot every moon separately for every calendar year.
+    Fit every moon separately for every calendar year.
 
-    Each year is processed completely independently: the sinusoidal fit
-    for a year uses only that year's observations, and its time axis
-    starts at that year's first observation. Data from different years
-    are never combined, and a year with too few observations is reported
-    as "not fitted" rather than being given another year's fit.
+    Each year is processed completely independently: a year's fit uses only
+    that year's observations, and its time axis starts at that year's first
+    observation. A year with too few separate visits is reported as
+    "not fitted" rather than being given another year's result.
 
     Outputs:
         results/angular_separations_<year>.csv
-        results/sinusoidal_fits_<year>.csv
-        results/sinusoidal_fits.csv            (all years, with a year column)
-        results/angular_plots/<year>/<moon>_separation.png
-
-    New years are handled automatically.
+        results/orbit_fits_<year>.csv
+        results/orbit_fits.csv                 (all years, with a year column)
+        results/angular_plots/<year>/<moon>_orbit.png
     """
 
     ANGULAR_PLOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -762,25 +1170,27 @@ def plot_angular_separations(df):
     df = df.dropna(subset=["datetime"])
     df["year"] = df["datetime"].dt.year
 
-    fit_columns = [
-        "moon", "year", "n_observations", "n_nights", "fit_type",
-        "offset_arcsec", "amplitude_arcsec",
-        "period_days", "period_error_days", "phase_rad",
+    columns = [
+        "moon", "year", "n_images", "n_visits", "fit_status",
+        "period_days", "period_error_days", "period_status",
+        "next_best_period_days", "next_best_delta_chi2",
+        "semi_major_arcsec", "semi_major_err_arcsec",
+        "semi_minor_arcsec", "semi_minor_err_arcsec",
+        "minor_over_major", "ring_opening_deg", "major_axis_pa_deg",
+        "used_dz_in_fit", "semi_major_3d_arcsec",
+        "semi_major_km", "semi_major_err_km",
+        "rms_residual_arcsec", "weighted",
+        "dz_amplitude_km", "dz_rms_km", "dz_rms_over_amplitude",
     ]
 
-    fit_records = []
+    all_records = []
 
     for year, year_data in df.groupby("year"):
 
-        # Save this year's measurements.
-        csv_path = OUT_DIR / f"angular_separations_{year}.csv"
-
         year_data.drop(columns=["year"]).to_csv(
-            csv_path,
-            index=False,
+            OUT_DIR / f"angular_separations_{year}.csv", index=False
         )
-
-        print(f"Saved {csv_path}")
+        print(f"Saved {OUT_DIR / f'angular_separations_{year}.csv'}")
 
         year_dir = ANGULAR_PLOT_DIR / str(year)
         year_dir.mkdir(parents=True, exist_ok=True)
@@ -788,194 +1198,142 @@ def plot_angular_separations(df):
         year_records = []
 
         for moon, moon_year in year_data.groupby("moon"):
-            group = moon_year.sort_values("datetime").copy()
-
-            group = group.loc[
-                np.isfinite(group["separation_arcsec"])
+            usable = moon_year.loc[
+                np.isfinite(moon_year["sky_x_arcsec"])
+                & np.isfinite(moon_year["sky_y_arcsec"])
             ]
 
-            if group.empty:
+            if usable.empty:
                 continue
 
-            year_origin = group["datetime"].min()
+            visits = combine_into_visits(usable)
+            origin = visits["datetime"].min()
+            t = (visits["datetime"] - origin).dt.total_seconds().to_numpy() / 86400.0
 
-            t_year = (
-                group["datetime"] - year_origin
-            ).dt.total_seconds().to_numpy() / 86400.0
+            x_v = visits["x"].to_numpy(dtype=float)
+            y_v = visits["y"].to_numpy(dtype=float)
+            sx_v = visits["x_err"].to_numpy(dtype=float)
+            sy_v = visits["y_err"].to_numpy(dtype=float)
 
-            y_year = group["separation_arcsec"].to_numpy(dtype=float)
-            error_year = group["error_arcsec"].to_numpy(dtype=float)
+            # Depth offset as a third coordinate, in the same angular units
+            # as x and y: dz / (planet distance per arcsecond).
+            z_v = sz_v = None
 
-            n_nights = int(group["datetime"].dt.normalize().nunique())
+            if USE_DZ_IN_FIT:
+                dz_v = visits["dz_km"].to_numpy(dtype=float)
+                d_v = visits["dsat_km"].to_numpy(dtype=float)
 
-            have_error = (
-                np.isfinite(error_year) & (error_year >= 0)
-            )
-
-            fig, ax = plt.subplots(figsize=(10, 6))
-
-            # Observations with valid error bars.
-            ax.errorbar(
-                t_year[have_error],
-                y_year[have_error],
-                yerr=error_year[have_error],
-                fmt="o",
-                capsize=3,
-                label="Observed separation with uncertainty",
-            )
-
-            # Retain observations even when their errors are missing.
-            ax.plot(
-                t_year[~have_error],
-                y_year[~have_error],
-                "o",
-                label="Observed separation without uncertainty",
-            )
-
-            # Fit this year on its own. There is deliberately no fallback
-            # to a fit made from other years' data.
-            yearly_fit = None
-
-            if len(group) >= MIN_OBSERVATIONS_FOR_FIT:
-                yearly_fit = fit_sinusoid(
-                    t_year,
-                    y_year,
-                    error_year,
-                    moon,
-                    label=f"{moon} {year}",
-                )
-
-                if (
-                    yearly_fit is not None
-                    and n_nights < MIN_NIGHTS_FOR_RELIABLE_FIT
-                ):
-                    print(
-                        f"Warning: {moon} {year}: the fit uses "
-                        f"{len(group)} images but only {n_nights} "
-                        f"distinct night(s); the period is likely to be "
-                        f"poorly constrained."
-                    )
-
-            if yearly_fit is not None:
-                t0_fit, parameters, covariance = yearly_fit
-
-                line_t = np.linspace(
-                    t_year.min(),
-                    t_year.max(),
-                    800,
-                )
-                line_y = sinusoid(line_t - t0_fit, *parameters)
-
-                ax.plot(
-                    line_t,
-                    line_y,
-                    "-",
-                    label=(
-                        f"{year} sinusoidal fit "
-                        f"(P = {parameters[2]:.3f} days)"
-                    ),
-                )
-
-                if np.all(np.isfinite(covariance)):
-                    parameter_errors = np.sqrt(
-                        np.maximum(np.diag(covariance), 0)
-                    )
-                    period_error = parameter_errors[2]
+                if np.all(np.isfinite(dz_v)) and np.all(np.isfinite(d_v)):
+                    z_v = dz_v / (d_v / ARCSEC_PER_RAD)
+                    sz_v = np.hypot(sx_v, sy_v) / np.sqrt(2.0)
                 else:
-                    period_error = np.nan
+                    print(
+                        f"Note: {moon} {year}: dz or dSat missing, "
+                        "fitting sky positions only."
+                    )
 
-                year_records.append({
-                    "moon": moon,
-                    "year": year,
-                    "n_observations": len(group),
-                    "n_nights": n_nights,
-                    "fit_type": "yearly fit",
-                    "offset_arcsec": parameters[0],
-                    "amplitude_arcsec": parameters[1],
-                    "period_days": parameters[2],
-                    "period_error_days": period_error,
-                    "phase_rad": parameters[3],
-                })
+            result = fit_orbit_ellipse(t, x_v, y_v, sx_v, sy_v, z_v, sz_v)
 
-                print(
-                    f"{moon} {year}: "
-                    f"period = {parameters[2]:.4f} days"
+            record = {
+                "moon": moon,
+                "year": year,
+                "n_images": int(visits["n_images"].sum()),
+                "n_visits": len(visits),
+            }
+
+            if result is None:
+                needed = MIN_VISITS_WITH_DZ if z_v is not None else MIN_VISITS_FOR_FIT
+                record["fit_status"] = (
+                    f"not fitted: needs at least {needed} separate visits"
                 )
-
+                print(
+                    f"{moon} {year}: not fitted "
+                    f"({len(visits)} visit(s); need {needed})."
+                )
             else:
-                # Explicitly show why the fit is absent.
-                ax.text(
-                    0.03,
-                    0.97,
-                    "No sinusoidal fit for this year: insufficient "
-                    "observations.\n"
-                    f"At least {MIN_OBSERVATIONS_FOR_FIT} observations "
-                    "are required.",
-                    transform=ax.transAxes,
-                    va="top",
-                    fontsize=9,
-                )
+                finite_d = visits["dsat_km"].to_numpy(dtype=float)
+                finite_d = finite_d[np.isfinite(finite_d)]
+                distance = float(finite_d.mean()) if len(finite_d) else np.nan
+                km_per_arcsec = distance / ARCSEC_PER_RAD
 
-                year_records.append({
-                    "moon": moon,
-                    "year": year,
-                    "n_observations": len(group),
-                    "n_nights": n_nights,
-                    "fit_type": "not fitted: insufficient data",
-                    "offset_arcsec": np.nan,
-                    "amplitude_arcsec": np.nan,
-                    "period_days": np.nan,
-                    "period_error_days": np.nan,
-                    "phase_rad": np.nan,
+                record.update({
+                    "fit_status": "fitted",
+                    "period_days": result["period"],
+                    "period_error_days": result["period_error"],
+                    "period_status": result["status"],
+                    "next_best_period_days": result["next_period"],
+                    "next_best_delta_chi2": result["next_delta"],
+                    "semi_major_arcsec": result["major"],
+                    "semi_major_err_arcsec": result["major_error"],
+                    "semi_minor_arcsec": result["minor"],
+                    "semi_minor_err_arcsec": result["minor_error"],
+                    "minor_over_major": result["minor"] / result["major"],
+                    "ring_opening_deg": float(np.degrees(np.arcsin(
+                        min(result["minor"] / result["major"], 1.0)
+                    ))),
+                    "major_axis_pa_deg": result["angle"],
+                    "used_dz_in_fit": result["used_dz"],
+                    "semi_major_3d_arcsec": result["major3d"],
+                    # With dz the 3D orbit radius is used; without it, the
+                    # sky ellipse's semi-major axis.
+                    "semi_major_km": (
+                        (result["major3d"] if result["used_dz"]
+                         else result["major"]) * km_per_arcsec
+                        if np.isfinite(distance) else np.nan
+                    ),
+                    "semi_major_err_km": (
+                        (result["major3d_error"] if result["used_dz"]
+                         else result["major_error"]) * km_per_arcsec
+                        if np.isfinite(distance) else np.nan
+                    ),
+                    "rms_residual_arcsec": result["rms"],
+                    "weighted": result["weighted"],
                 })
+                record.update(dz_consistency(visits, t, result["frequency"]))
 
                 print(
-                    f"{moon} {year}: no fit; "
-                    f"{len(group)} observations available."
+                    f"{moon} {year}: period = {result['period']:.3f} "
+                    f"+/- {result['period_error']:.3f} d "
+                    f"({result['status']}"
+                    f"{', with dz' if result['used_dz'] else ', sky only'}); "
+                    f"semi-major axis = {result['major']:.1f} arcsec"
                 )
 
-            parent = PARENT_BODY.get(moon, "parent planet")
+                if result["status"] == "ambiguous":
+                    others = ", ".join(
+                        f"{p:.3f} d" for p, _ in result["alternatives"][:3]
+                    )
+                    print(
+                        f"    Warning: other periods fit nearly as well "
+                        f"({others}). More visits at different spacings "
+                        f"are needed to separate them."
+                    )
 
-            ax.set_title(
-                f"{moon.capitalize()}: angular separation "
-                f"from {parent.capitalize()} ({year})"
+                if not result["weighted"]:
+                    print(
+                        f"    Note: {moon} {year} was fitted without "
+                        "per-point uncertainties (some are missing)."
+                    )
+
+            year_records.append(record)
+
+            _plot_orbit(
+                year_dir / f"{moon}_orbit.png",
+                moon, year, origin, visits, t, result,
             )
-            ax.set_xlabel(
-                f"Days since {year_origin:%Y-%m-%d %H:%M}"
-            )
-            ax.set_ylabel("Angular separation (arcseconds)")
-            ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=8)
-            fig.tight_layout()
 
-            fig.savefig(
-                year_dir / f"{moon}_separation.png",
-                dpi=180,
-            )
-            plt.close(fig)
+        year_table = pd.DataFrame(year_records).reindex(columns=columns)
+        year_table.to_csv(OUT_DIR / f"orbit_fits_{year}.csv", index=False)
 
-        # One fit-summary file per year.
-        pd.DataFrame(
-            year_records,
-            columns=fit_columns,
-        ).to_csv(
-            OUT_DIR / f"sinusoidal_fits_{year}.csv",
-            index=False,
-        )
+        all_records.extend(year_records)
 
-        fit_records.extend(year_records)
-
-    # Summary of all years. Each row is still an independent yearly fit.
-    pd.DataFrame(
-        fit_records,
-        columns=fit_columns,
-    ).to_csv(
-        OUT_DIR / "sinusoidal_fits.csv",
-        index=False,
+    pd.DataFrame(all_records).reindex(columns=columns).to_csv(
+        OUT_DIR / "orbit_fits.csv", index=False
     )
 
-    print(f"Yearly plots saved in {ANGULAR_PLOT_DIR}")
-    print(f"Fit summary saved to {OUT_DIR / 'sinusoidal_fits.csv'}")
+    print(f"Orbit plots saved in {ANGULAR_PLOT_DIR}")
+    print(f"Fit summary saved to {OUT_DIR / 'orbit_fits.csv'}")
+
 
 # ============================================================
 # MAIN PROGRAM
@@ -992,15 +1350,15 @@ def main():
 
     angular = calculate_angular_separations(centres)
 
-    plot_angular_separations(angular)
+    if USE_ORBIT_FIT_MODULE:
+        import orbit_fit
 
-    orbit_fit.fit_and_plot_orbits(
-        angular, OUT_DIR, INITIAL_PERIODS, PARENT_BODY
-    )
+        orbit_fit.fit_and_plot_orbits(angular, OUT_DIR, None, PARENT_BODY)
+    else:
+        fit_orbits_by_year(angular)
 
     print("\nPipeline complete.")
 
 
 if __name__ == "__main__":
     main()
-

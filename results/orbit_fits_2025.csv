@@ -1,6 +1,6 @@
-moon,year,parent,n_observations,n_nights,status,a_arcsec,a_err_arcsec,b_arcsec,b_over_a,b_over_a_err,tilt_deg,psi_deg,psi_err_deg,period_days,period_err_days,phase_rad,chi2_red
-dione,2025,saturn,2,2,not fitted: insufficient data,,,,,,,,,,,,
-enceladus,2025,saturn,2,2,not fitted: insufficient data,,,,,,,,,,,,
-rhea,2025,saturn,3,3,not fitted: insufficient data,,,,,,,,,,,,
-tethys,2025,saturn,4,4,not fitted: insufficient data,,,,,,,,,,,,
-titan,2025,saturn,4,4,not fitted: insufficient data,,,,,,,,,,,,
+moon,year,n_images,n_visits,fit_status,period_days,period_error_days,period_status,next_best_period_days,next_best_delta_chi2,semi_major_arcsec,semi_major_err_arcsec,semi_minor_arcsec,semi_minor_err_arcsec,minor_over_major,ring_opening_deg,major_axis_pa_deg,used_dz_in_fit,semi_major_3d_arcsec,semi_major_km,semi_major_err_km,rms_residual_arcsec,weighted,dz_amplitude_km,dz_rms_km,dz_rms_over_amplitude
+dione,2025,2,2,not fitted: needs at least 6 separate visits,,,,,,,,,,,,,,,,,,,,,
+enceladus,2025,2,2,not fitted: needs at least 6 separate visits,,,,,,,,,,,,,,,,,,,,,
+rhea,2025,3,3,not fitted: needs at least 6 separate visits,,,,,,,,,,,,,,,,,,,,,
+tethys,2025,4,4,not fitted: needs at least 6 separate visits,,,,,,,,,,,,,,,,,,,,,
+titan,2025,4,4,not fitted: needs at least 6 separate visits,,,,,,,,,,,,,,,,,,,,,
