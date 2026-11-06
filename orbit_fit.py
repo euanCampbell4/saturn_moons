@@ -66,6 +66,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3D projection)
 from scipy.optimize import least_squares, minimize_scalar
 
 
@@ -101,6 +102,18 @@ FIT_CENTRE_OFFSET = False
 
 # Draw the model curve over at least one full period in the time plots.
 EXTEND_MODEL_TO_FULL_PERIOD = True
+
+# 3D orbit diagrams (one extra figure per moon and year).
+MAKE_3D_PLOTS = True
+
+# Used ONLY to draw the 3D plot to scale when the data has no dsat_km column.
+# Approximate Earth-planet distances in AU; the figure is labelled
+# "approximate scale" when these are used. Replace with your own values, or
+# add a dSat column to relative_positions.csv for an exact scale.
+FALLBACK_PLANET_DISTANCE_AU = {"saturn": 9.0, "neptune": 29.0}
+
+# Equatorial radius of each planet in km, for drawing it to scale in 3D.
+PLANET_RADIUS_KM = {"saturn": 60268.0, "neptune": 24764.0}
 
 ARCSEC_PER_RAD = 206264.80624709636
 
@@ -139,6 +152,40 @@ def _wrap(psi, phase):
     return psi - m * np.pi, (phase - m * np.pi) % (2 * np.pi)
 
 
+def ensure_distance_columns(df):
+    """
+    Make sure the table has dz_km and dsat_km columns.
+
+    Accepts the names used in relative_positions.csv after the loader
+    lower-cases them (for example "dz", "dz (km)", "dsat"). Values are read
+    as AU if their typical size is below 10, otherwise as km.
+    """
+
+    def find(prefix):
+        for column in df.columns:
+            if str(column).lower().replace(" ", "").startswith(prefix):
+                return column
+        return None
+
+    for target, prefix in (("dz_km", "dz"), ("dsat_km", "dsat")):
+        if target in df.columns:
+            continue
+
+        source = find(prefix)
+
+        if source is None:
+            continue
+
+        values = pd.to_numeric(df[source], errors="coerce")
+        median = np.nanmedian(np.abs(values)) if values.notna().any() else np.nan
+        in_au = np.isfinite(median) and median < 10
+        df[target] = values * 1.495978707e8 if in_au else values
+        print(f"Using column '{source}' as {target} "
+              f"({'AU converted to km' if in_au else 'already km'}).")
+
+    return df
+
+
 def sky_errors(df):
     """Propagate pixel errors through the CD matrix, per sky axis."""
 
@@ -149,8 +196,16 @@ def sky_errors(df):
         return nan, nan
 
     cd = df[needed[:4]].to_numpy(dtype=float) * 3600.0
-    sdx = df["sigma_dx"].to_numpy(dtype=float)
-    sdy = df["sigma_dy"].to_numpy(dtype=float)
+    sdx = df["sigma_dx"].to_numpy(dtype=float, copy=True)
+    sdy = df["sigma_dy"].to_numpy(dtype=float, copy=True)
+
+    # Missing centroid errors get the typical error of the measured ones,
+    # so one missing file does not remove the weights for a whole moon.
+    for values in (sdx, sdy):
+        finite = values[np.isfinite(values)]
+
+        if len(finite):
+            values[~np.isfinite(values)] = float(np.median(finite))
 
     sx = np.hypot(cd[:, 0] * sdx, cd[:, 1] * sdy)
     sy = np.hypot(cd[:, 2] * sdx, cd[:, 3] * sdy)
@@ -613,6 +668,366 @@ def plot_moon_year(group, fit, moon, year, parent, origin, path):
     plt.close(fig)
 
 
+def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
+    """
+    3D orbit diagram with the planet at the centre.
+
+    Axes (kilometres): East, North, and depth towards Earth (dz). Four
+    views: 3D, the view from Earth (what the telescope sees), east against
+    depth, and north against depth. The east-depth view is the closest to a
+    top-down view of the orbit, because the orbit is nearly edge-on from
+    Earth.
+    """
+
+    if "dz_km" not in group or not np.isfinite(group["dz_km"]).any():
+        print(
+            f"No 3D plot for {moon} {year}: no usable dz values "
+            "(need a dz column in relative_positions.csv)."
+        )
+        return
+
+    dsat = (
+        group["dsat_km"].to_numpy(dtype=float)
+        if "dsat_km" in group else np.array([np.nan])
+    )
+    dsat = dsat[np.isfinite(dsat)]
+
+    approximate = len(dsat) == 0
+
+    if approximate:
+        au = FALLBACK_PLANET_DISTANCE_AU.get(parent)
+
+        if au is None:
+            print(
+                f"No 3D plot for {moon} {year}: no dSat column and no "
+                f"fallback distance for '{parent}' (add it to "
+                "FALLBACK_PLANET_DISTANCE_AU or give the moon a parent in "
+                "PARENT_BODY)."
+            )
+            return
+
+        distance_km = au * 1.495978707e8
+    else:
+        distance_km = float(dsat.mean())
+
+    km = distance_km / ARCSEC_PER_RAD     # km per arcsecond
+
+    good = np.isfinite(group["dz_km"].to_numpy(dtype=float))
+    obs_x = group["sky_x_arcsec"].to_numpy(dtype=float)[good] * km
+    obs_y = group["sky_y_arcsec"].to_numpy(dtype=float)[good] * km
+    obs_z = group["dz_km"].to_numpy(dtype=float)[good]
+    obs_t = group["t"].to_numpy(dtype=float)[good]
+
+    # Fitted orbit as a 3D circle (km).
+    curve = None
+
+    if fit is not None:
+        tt = np.linspace(0, fit["period"], 600)
+        cx, cy = model_from_fit(fit, tt)
+
+        # Direction of travel along the line of sight is fixed by the fit
+        # when dz was used; otherwise choose the sign that matches dz.
+        if fit["used_dz"]:
+            sign = fit["z_sign"]
+        else:
+            z_obs_arc = obs_z / km
+            theta_t = obs_t
+            candidates = []
+
+            for trial in (1.0, -1.0):
+                model = depth_model(
+                    theta_t, fit["a"], fit["k"], fit["period"],
+                    fit["phase"], trial,
+                )
+                candidates.append((np.sum((z_obs_arc - model) ** 2), trial))
+
+            sign = min(candidates)[1]
+
+        cz = depth_model(
+            tt, fit["a"], fit["k"], fit["period"], fit["phase"], sign
+        )
+        curve = (cx * km, cy * km, cz * km)
+
+    # Equal-scale limits in all three directions.
+    pieces = [obs_x, obs_y, obs_z]
+    if curve is not None:
+        pieces += list(curve)
+    radius = 1.08 * max(float(np.max(np.abs(a))) for a in pieces)
+
+    fig = plt.figure(figsize=(13, 10))
+    ax3 = fig.add_subplot(2, 2, 1, projection="3d")
+    ax_sky = fig.add_subplot(2, 2, 2)
+    ax_top = fig.add_subplot(2, 2, 3)
+    ax_side = fig.add_subplot(2, 2, 4)
+
+    scale = 1e6   # show megametres
+
+    # ---- 3D ----
+    ax3.scatter(
+        obs_x / scale, obs_y / scale, obs_z / scale,
+        c=obs_t, cmap="viridis", s=34, depthshade=False, label="Observed",
+    )
+    if curve is not None:
+        ax3.plot(
+            curve[0] / scale, curve[1] / scale, curve[2] / scale,
+            "--", color="tab:red", lw=1.2, label="Fitted orbit",
+        )
+    ax3.scatter([0], [0], [0], color="gold", edgecolor="k", s=140,
+                label=parent.capitalize())
+    ax3.plot([0, 0], [0, 0], [0, radius / scale], color="0.4", lw=1)
+    ax3.text(0, 0, radius / scale, " to Earth", fontsize=8)
+    ax3.set_xlim(-radius / scale, radius / scale)
+    ax3.set_ylim(-radius / scale, radius / scale)
+    ax3.set_zlim(-radius / scale, radius / scale)
+    ax3.set_box_aspect((1, 1, 1))
+    ax3.set_xlabel("East (10$^6$ km)")
+    ax3.set_ylabel("North (10$^6$ km)")
+    ax3.set_zlabel("Towards Earth (10$^6$ km)")
+    ax3.view_init(elev=22, azim=-60)
+    ax3.legend(fontsize=7, loc="upper left")
+    ax3.set_title("3D orbit")
+
+    def panel(ax, xs, ys, cxs, cys, xlabel, ylabel, title):
+        ax.scatter(xs / scale, ys / scale, c=obs_t, cmap="viridis", s=34,
+                   zorder=3)
+        if cxs is not None:
+            ax.plot(cxs / scale, cys / scale, "--", color="tab:red", lw=1.2)
+        ax.plot(0, 0, "o", color="gold", mec="k", ms=11, zorder=4)
+        ax.set_xlim(-radius / scale, radius / scale)
+        ax.set_ylim(-radius / scale, radius / scale)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+
+    cxk, cyk, czk = curve if curve is not None else (None, None, None)
+
+    panel(ax_sky, obs_x, obs_y, cxk, cyk,
+          "East (10$^6$ km)", "North (10$^6$ km)", "View from Earth")
+    panel(ax_top, obs_x, obs_z, cxk, czk,
+          "East (10$^6$ km)", "Towards Earth (10$^6$ km)",
+          "View from above (east vs depth)")
+    panel(ax_side, obs_y, obs_z, cyk, czk,
+          "North (10$^6$ km)", "Towards Earth (10$^6$ km)",
+          "Side view (north vs depth)")
+    ax_top.invert_xaxis()
+
+    title = f"{moon.capitalize()} {year}: orbit around {parent.capitalize()}"
+    if fit is not None:
+        title += (
+            f"   (P = {fit['period']:.3f} d, {fit['period_status']}, "
+            f"{'with dz' if fit['used_dz'] else 'sky only'})"
+        )
+    if approximate:
+        title += "\napproximate scale: no dSat column, assumed distance used"
+
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def _geometry_km(group, fit, parent):
+    """
+    Observed points and fitted 3D orbit of one moon, in km.
+
+    Returns (obs_x, obs_y, obs_z, obs_t, curve, approximate) where curve is
+    (x, y, z) arrays or None, and approximate says whether the fallback
+    planet distance was used. Returns None if the moon has no dz values or
+    no distance can be found.
+    """
+
+    if "dz_km" not in group or not np.isfinite(group["dz_km"]).any():
+        return None
+
+    dsat = (
+        group["dsat_km"].to_numpy(dtype=float)
+        if "dsat_km" in group else np.array([np.nan])
+    )
+    dsat = dsat[np.isfinite(dsat)]
+    approximate = len(dsat) == 0
+
+    if approximate:
+        au = FALLBACK_PLANET_DISTANCE_AU.get(parent)
+
+        if au is None:
+            return None
+
+        distance_km = au * 1.495978707e8
+    else:
+        distance_km = float(dsat.mean())
+
+    km = distance_km / ARCSEC_PER_RAD
+
+    good = np.isfinite(group["dz_km"].to_numpy(dtype=float))
+    obs_x = group["sky_x_arcsec"].to_numpy(dtype=float)[good] * km
+    obs_y = group["sky_y_arcsec"].to_numpy(dtype=float)[good] * km
+    obs_z = group["dz_km"].to_numpy(dtype=float)[good]
+    obs_t = group["t"].to_numpy(dtype=float)[good]
+
+    curve = None
+
+    if fit is not None:
+        tt = np.linspace(0, fit["period"], 600)
+        cx, cy = model_from_fit(fit, tt)
+
+        if fit["used_dz"]:
+            sign = fit["z_sign"]
+        else:
+            trials = []
+
+            for trial in (1.0, -1.0):
+                model = depth_model(
+                    obs_t, fit["a"], fit["k"], fit["period"],
+                    fit["phase"], trial,
+                )
+                trials.append((np.sum((obs_z / km - model) ** 2), trial))
+
+            sign = min(trials)[1]
+
+        cz = depth_model(
+            tt, fit["a"], fit["k"], fit["period"], fit["phase"], sign
+        )
+        curve = (cx * km, cy * km, cz * km)
+
+    return obs_x, obs_y, obs_z, obs_t, curve, approximate
+
+
+def plot_system_3d(groups, fits, parent, year, path):
+    """
+    All moons of one planet on a single 3D diagram, to scale.
+
+    `groups` and `fits` map moon name to its table of images and its fit.
+    Axes (km): East, North, depth towards Earth. A second panel shows the
+    view from Earth and a third the east-depth view.
+    """
+
+    moons = [
+        m for m in groups
+        if PARENT_BODY_LOOKUP.get(m) == parent
+    ]
+
+    pieces = {}
+    approximate = False
+
+    for moon in moons:
+        geometry = _geometry_km(groups[moon], fits.get(moon), parent)
+
+        if geometry is not None:
+            pieces[moon] = geometry
+            approximate = approximate or geometry[5]
+
+    if not pieces:
+        print(
+            f"No 3D system plot for {parent} {year}: no moon has usable "
+            "dz values."
+        )
+        return
+
+    arrays = []
+
+    for obs_x, obs_y, obs_z, _, curve, _ in pieces.values():
+        arrays += [obs_x, obs_y, obs_z]
+        if curve is not None:
+            arrays += list(curve)
+
+    radius = 1.08 * max(float(np.max(np.abs(a))) for a in arrays)
+    scale = 1e6
+
+    colours = plt.cm.tab10(np.arange(len(pieces)) % 10)
+
+    fig = plt.figure(figsize=(14, 7))
+    ax3 = fig.add_subplot(1, 2, 1, projection="3d")
+    ax_sky = fig.add_subplot(2, 4, 3)
+    ax_top = fig.add_subplot(2, 4, 4)
+    ax_note = fig.add_subplot(2, 2, 4)
+    ax_note.axis("off")
+
+    # Planet drawn to scale.
+    r_planet = PLANET_RADIUS_KM.get(parent, 0.0) / scale
+    if r_planet > 0:
+        u, v = np.mgrid[0:2 * np.pi:30j, 0:np.pi:15j]
+        ax3.plot_surface(
+            r_planet * np.cos(u) * np.sin(v),
+            r_planet * np.sin(u) * np.sin(v),
+            r_planet * np.cos(v),
+            color="gold", alpha=0.9, linewidth=0,
+        )
+
+    for colour, (moon, geom) in zip(colours, pieces.items()):
+        obs_x, obs_y, obs_z, _, curve, _ = geom
+
+        ax3.scatter(
+            obs_x / scale, obs_y / scale, obs_z / scale,
+            color=colour, s=22, depthshade=False, label=moon.capitalize(),
+        )
+        ax_sky.scatter(obs_x / scale, obs_y / scale, color=colour, s=14)
+        ax_top.scatter(obs_x / scale, obs_z / scale, color=colour, s=14)
+
+        if curve is not None:
+            ax3.plot(
+                curve[0] / scale, curve[1] / scale, curve[2] / scale,
+                "--", color=colour, lw=1,
+            )
+            ax_sky.plot(curve[0] / scale, curve[1] / scale, "--",
+                        color=colour, lw=0.9)
+            ax_top.plot(curve[0] / scale, curve[2] / scale, "--",
+                        color=colour, lw=0.9)
+
+    ax3.plot([0, 0], [0, 0], [0, radius / scale], color="0.4", lw=1)
+    ax3.text(0, 0, radius / scale, " to Earth", fontsize=8)
+    lim = radius / scale
+    ax3.set_xlim(-lim, lim)
+    ax3.set_ylim(-lim, lim)
+    ax3.set_zlim(-lim, lim)
+    ax3.set_box_aspect((1, 1, 1))
+    ax3.set_xlabel("East (10$^6$ km)")
+    ax3.set_ylabel("North (10$^6$ km)")
+    ax3.set_zlabel("Towards Earth (10$^6$ km)")
+    ax3.view_init(elev=22, azim=-60)
+    ax3.legend(fontsize=8, loc="upper left")
+    ax3.set_title(f"{parent.capitalize()} system in 3D")
+
+    for ax, title, xlabel, ylabel in (
+        (ax_sky, "From Earth", "East", "North"),
+        (ax_top, "East vs depth", "East", "Towards Earth"),
+    ):
+        ax.plot(0, 0, "o", color="gold", mec="k", ms=8, zorder=4)
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.3)
+        ax.set_title(title, fontsize=9)
+        ax.set_xlabel(f"{xlabel} (10$^6$ km)", fontsize=8)
+        ax.set_ylabel(f"{ylabel} (10$^6$ km)", fontsize=8)
+        ax.tick_params(labelsize=7)
+
+    ax_top.invert_xaxis()
+
+    lines = []
+    for moon in pieces:
+        fit = fits.get(moon)
+        if fit is None:
+            lines.append(f"{moon.capitalize()}: not fitted (points only)")
+        else:
+            lines.append(
+                f"{moon.capitalize()}: P = {fit['period']:.3f} d "
+                f"({fit['period_status']})"
+            )
+
+    ax_note.text(0.0, 1.0, "\n".join(lines), va="top", fontsize=9,
+                 family="monospace")
+
+    title = f"{parent.capitalize()} system, {year}"
+    if approximate:
+        title += "  (approximate scale: assumed planet distance)"
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def plot_system_view(year_df, fits, parent, year, path):
     """All moons of one planet on a single sky-plane diagram."""
 
@@ -676,7 +1091,9 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
     Writes:
         <out_dir>/orbit_fits.csv, orbit_fits_<year>.csv
         <out_dir>/orbit_plots/<year>/<moon>_orbit.png
+        <out_dir>/orbit_plots/<year>/<moon>_orbit3d.png
         <out_dir>/orbit_plots/<year>/<planet>_system.png
+        <out_dir>/orbit_plots/<year>/<planet>_system3d.png
     """
 
     global PARENT_BODY_LOOKUP
@@ -692,6 +1109,14 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
     df = df.dropna(subset=["datetime", "sky_x_arcsec", "sky_y_arcsec"])
     df["year"] = df["datetime"].dt.year
     df["sigma_sky_x"], df["sigma_sky_y"] = sky_errors(df)
+    df = ensure_distance_columns(df)
+
+    if MAKE_3D_PLOTS and "dz_km" not in df.columns:
+        print(
+            "Note: no dz column found, so no 3D plots will be made. "
+            "Add dz to relative_positions.csv and make sure your pipeline "
+            "keeps that column."
+        )
 
     all_records = []
 
@@ -700,6 +1125,7 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
         year_dir.mkdir(parents=True, exist_ok=True)
 
         fits = {}
+        groups = {}
         year_records = []
 
         for moon, group in year_df.groupby("moon"):
@@ -716,6 +1142,7 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
             visits = combine_visits(group)
             fit = fit_orbit(visits)
             fits[moon] = fit
+            groups[moon] = group
 
             record = {
                 "moon": moon, "year": year, "parent": parent,
@@ -796,12 +1223,24 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                 year_dir / f"{moon}_orbit.png",
             )
 
+            if MAKE_3D_PLOTS:
+                plot_orbit_3d(
+                    group, fit, moon, year, parent, origin,
+                    year_dir / f"{moon}_orbit3d.png",
+                )
+
         for parent in sorted(set(parent_body.get(m) for m in fits)):
             if parent:
                 plot_system_view(
                     year_df, fits, parent, year,
                     year_dir / f"{parent}_system.png",
                 )
+
+                if MAKE_3D_PLOTS:
+                    plot_system_3d(
+                        groups, fits, parent, year,
+                        year_dir / f"{parent}_system3d.png",
+                    )
 
         year_table = pd.DataFrame(year_records).reindex(columns=FIT_COLUMNS)
         year_table.to_csv(out_dir / f"orbit_fits_{year}.csv", index=False)

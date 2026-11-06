@@ -133,7 +133,7 @@ USE_DZ_IN_FIT = True
 # scan, centred ellipse). True: the separate orbit_fit.py module (physical
 # ellipse model with tilt and orientation, plus system plots). Run only one,
 # because both write results/orbit_fits.csv.
-USE_ORBIT_FIT_MODULE = False
+USE_ORBIT_FIT_MODULE = True
 
 N_BOOTSTRAP = 300                 # resamples used for the ellipse-axis errors
 
@@ -146,8 +146,10 @@ N_BOOTSTRAP = 300                 # resamples used for the ellipse-axis errors
 # and larger values as km.
 DIST_UNIT = "auto"                # "auto", "au" or "km"
 
-# Used for the km conversion when the CSV has no dsat column (AU), else None.
-PLANET_DISTANCE_AU = None
+# Used for the km conversion and the dz fit when the CSV has no dsat column.
+# One Earth-planet distance in AU per planet (use JPL Horizons "delta" for a
+# typical date), or None. A single number is also accepted.
+PLANET_DISTANCE_AU = None          # e.g. {"saturn": 9.0, "neptune": 29.0}
 
 # Print additional diagnostics.
 VERBOSE = True
@@ -426,12 +428,7 @@ def load_relative_positions():
     df["dz_km"] = to_km("dz")
     df["dsat_km"] = to_km("dsat")
 
-    if df["dsat_km"].isna().all() and PLANET_DISTANCE_AU is not None:
-        df["dsat_km"] = PLANET_DISTANCE_AU * 1.495978707e8
-
-    if df["dsat_km"].isna().all():
-        print("Note: no dsat column or PLANET_DISTANCE_AU, so results are "
-              "in arcseconds only (no km).")
+    dsat_from_column = not df["dsat_km"].isna().all()
 
     if not np.isfinite(
         df[numeric_columns].to_numpy(dtype=float)
@@ -449,6 +446,19 @@ def load_relative_positions():
             + ", ".join(unknown)
             + ". Add each moon to PARENT_BODY."
         )
+
+    if not dsat_from_column:
+        if isinstance(PLANET_DISTANCE_AU, dict):
+            df["dsat_km"] = df["parent"].map(PLANET_DISTANCE_AU) * 1.495978707e8
+        elif PLANET_DISTANCE_AU is not None:
+            df["dsat_km"] = PLANET_DISTANCE_AU * 1.495978707e8
+
+        if df["dsat_km"].isna().all():
+            print("Note: no dsat column or PLANET_DISTANCE_AU, so results "
+                  "are in arcseconds only and dz is not used in the fit.")
+        else:
+            print("Using PLANET_DISTANCE_AU for the km conversion "
+                  "(approximate: one distance for all dates).")
 
     return df
 
@@ -599,6 +609,20 @@ def calculate_angular_separations(centres):
         df["sigma_moon_y"], df["sigma_parent_y"]
     )
 
+    # Observations whose centroid files are missing have no error. Rather
+    # than dropping the weights for the whole moon (which makes the fit
+    # overconfident), give them the typical error of the measured ones and
+    # flag them.
+    df["error_filled"] = False
+
+    for column in ("sigma_dx", "sigma_dy"):
+        finite = df[column][np.isfinite(df[column])]
+
+        if len(finite):
+            missing = ~np.isfinite(df[column])
+            df.loc[missing, column] = float(finite.median())
+            df.loc[missing, "error_filled"] = True
+
     dx = df["dx"].to_numpy(dtype=float)
     dy = df["dy"].to_numpy(dtype=float)
 
@@ -672,7 +696,18 @@ def calculate_angular_separations(centres):
     if missing_moon.any():
         print(
             f"Warning: {missing_moon.sum()} observation(s) have "
-            "no matching moon centroid uncertainty."
+            "no matching moon centroid uncertainty, so they were given the "
+            "typical error of the others (error_filled = True):"
+        )
+        print(
+            "   " + ", ".join(
+                f"{row.data} ({row.date})"
+                for row in df.loc[missing_moon].itertuples()
+            )
+        )
+        print(
+            "   Check that profile files named <moon>_<image>_x/y exist in "
+            "data/<date>/ for these."
         )
 
     if missing_parent.any():
