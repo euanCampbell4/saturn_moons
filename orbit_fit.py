@@ -107,6 +107,13 @@ EXTEND_MODEL_TO_FULL_PERIOD = True
 # 3D orbit diagrams (one extra figure per moon and year).
 MAKE_3D_PLOTS = True
 
+# Animation of the fitted orbits moving through the observing period, with
+# each real measurement appearing on the night it was taken.
+MAKE_ANIMATIONS = True
+ANIMATION_FRAMES = 240            # frames per animation
+ANIMATION_FPS = 24
+ANIMATION_FORMATS = ("gif", "mp4")   # mp4 needs ffmpeg installed; skipped if missing
+
 # Used ONLY to draw the 3D plot to scale when the data has no dsat_km column.
 # Approximate Earth-planet distances in AU; the figure is labelled
 # "approximate scale" when these are used. Replace with your own values, or
@@ -1182,8 +1189,8 @@ def plot_system_3d(groups, fits, parent, year, path):
 
     colours = plt.cm.tab10(np.arange(len(pieces)) % 10)
 
-    fig = plt.figure(figsize=(20, 10))
-    ax3 = fig.add_subplot(2, 2, 2, projection="3d")
+    fig = plt.figure(figsize=(14, 7))
+    ax3 = fig.add_subplot(1, 2, 1, projection="3d")
     ax_sky = fig.add_subplot(2, 4, 3)
     ax_top = fig.add_subplot(2, 4, 4)
     ax_note = fig.add_subplot(2, 2, 4)
@@ -1290,6 +1297,225 @@ def plot_system_3d(groups, fits, parent, year, path):
     plt.close(fig)
 
 
+def _moon_track(group, fit, parent):
+    """
+    Everything needed to animate one moon, in km:
+      position(t_days)   fitted position at time t (days from the moon's first image)
+      curve              one full orbit (x, y, z)
+      obs                (t_days, x, y, z) of the real measurements
+      origin             datetime of the moon's first image
+    Returns None if the moon has no fit or no distance information.
+    """
+
+    geometry = _geometry_km(group, fit, parent)
+
+    if geometry is None or fit is None:
+        return None
+
+    obs_x, obs_y, obs_z, obs_t, curve, _, ecc_curve = geometry
+
+    if "dsat_km" in group and np.isfinite(group["dsat_km"]).any():
+        km = float(np.nanmean(group["dsat_km"])) / ARCSEC_PER_RAD
+    else:
+        km = FALLBACK_PLANET_DISTANCE_AU[parent] * 1.495978707e8 / ARCSEC_PER_RAD
+
+    ecc = fit.get("ecc")
+
+    if fit["used_dz"]:
+        sign = fit["z_sign"]
+    else:
+        z_obs_arc = obs_z / km
+        trials = [
+            (np.sum((z_obs_arc - depth_model(
+                obs_t, fit["a"], fit["k"], fit["period"], fit["phase"], tr
+            )) ** 2), tr)
+            for tr in (1.0, -1.0)
+        ]
+        sign = min(trials)[1]
+
+    def position(t):
+        t = np.atleast_1d(np.asarray(t, dtype=float))
+
+        if ecc is not None:
+            x, y, z = ecc_xyz(ecc, t)
+        else:
+            x, y = model_from_fit(fit, t)
+            z = depth_model(t, fit["a"], fit["k"], fit["period"],
+                            fit["phase"], sign)
+
+        return x * km, y * km, z * km
+
+    period = ecc["period"] if ecc is not None else fit["period"]
+    shown_curve = ecc_curve if ecc_curve is not None else curve
+
+    return {
+        "position": position,
+        "curve": shown_curve,
+        "obs": (obs_t, obs_x, obs_y, obs_z),
+        "origin": group["datetime"].min(),
+        "period": period,
+        "ecc": ecc is not None,
+        "status": fit["period_status"],
+    }
+
+
+def make_orbit_animation(groups, fits, parent, year, path_stem):
+    """
+    Animate the fitted orbits of one planet's moons through the observing
+    period (written as <path_stem>.gif and/or .mp4).
+
+    Left: view from Earth (east vs north). Right: east vs depth (the nearest
+    thing to a view from above, since Earth looks almost along the ring
+    plane). Solid dots are the fitted moons, a short trail shows where each
+    has just been, faint rings are the full orbits, and the small markers are
+    the real measurements, which appear on the night they were taken.
+    """
+
+    from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
+    import shutil
+
+    tracks = {}
+
+    for moon in sorted(groups):
+        if PARENT_BODY_LOOKUP.get(moon) != parent:
+            continue
+
+        track = _moon_track(groups[moon], fits.get(moon), parent)
+
+        if track is not None:
+            tracks[moon] = track
+
+    if not tracks:
+        print(f"No animation for {parent} {year}: no moon has a usable fit with dz.")
+        return
+
+    start = min(tr["origin"] for tr in tracks.values())
+    stop = max(groups[m]["datetime"].max() for m in tracks)
+    span = (stop - start).total_seconds() / 86400.0
+    t_start, t_end = -0.5, span + 0.5
+    times = np.linspace(t_start, t_end, ANIMATION_FRAMES)
+
+    # Per-moon offset from the shared clock, and measurement times on it.
+    for tr in tracks.values():
+        tr["offset"] = (tr["origin"] - start).total_seconds() / 86400.0
+        tr["obs_clock"] = tr["obs"][0] + tr["offset"]
+
+    reach = 1.1 * max(
+        float(np.max(np.abs(np.concatenate([tr["curve"][0], tr["curve"][2]]))))
+        for tr in tracks.values()
+    )
+    reach_y = 1.1 * max(
+        float(np.max(np.abs(tr["curve"][1]))) for tr in tracks.values()
+    )
+    scale, unit = (1e6, "10$^6$ km") if reach > 5e5 else (1e3, "10$^3$ km")
+
+    palette = plt.get_cmap("tab10")
+    colours = {m: palette(i % 10) for i, m in enumerate(sorted(tracks))}
+
+    fig, (ax_sky, ax_top) = plt.subplots(
+        1, 2, figsize=(12, 5.6), gridspec_kw={"width_ratios": [1.15, 1]}
+    )
+
+    for ax in (ax_sky, ax_top):
+        ax.set_aspect("equal")
+        ax.grid(alpha=0.3)
+        ax.scatter([0], [0], s=180, color="gold", edgecolor="k", zorder=5)
+
+    ax_sky.set_xlim(-reach / scale, reach / scale)
+    ax_sky.set_ylim(-max(reach_y, 0.25 * reach) / scale,
+                    max(reach_y, 0.25 * reach) / scale)
+    ax_sky.set_xlabel(f"East ({unit})")
+    ax_sky.set_ylabel(f"North ({unit})")
+    ax_sky.set_title("View from Earth")
+
+    ax_top.set_xlim(reach / scale, -reach / scale)      # east to the left
+    ax_top.set_ylim(-reach / scale, reach / scale)
+    ax_top.set_xlabel(f"East ({unit})")
+    ax_top.set_ylabel(f"Towards Earth ({unit})")
+    ax_top.set_title("East vs depth (closest to a view from above)")
+
+    artists = {}
+
+    for moon, tr in tracks.items():
+        c = colours[moon]
+        cx, cy, cz = tr["curve"]
+        ax_sky.plot(cx / scale, cy / scale, "-", color=c, lw=0.8, alpha=0.35)
+        ax_top.plot(cx / scale, cz / scale, "-", color=c, lw=0.8, alpha=0.35)
+
+        label = moon.capitalize() + (" (eccentric)" if tr["ecc"] else "")
+
+        artists[moon] = {
+            "dot_sky": ax_sky.plot([], [], "o", color=c, ms=9, mec="k",
+                                   zorder=6, label=label)[0],
+            "dot_top": ax_top.plot([], [], "o", color=c, ms=9, mec="k",
+                                   zorder=6)[0],
+            "trail_sky": ax_sky.plot([], [], "-", color=c, lw=2.2, alpha=0.8)[0],
+            "trail_top": ax_top.plot([], [], "-", color=c, lw=2.2, alpha=0.8)[0],
+            "obs_sky": ax_sky.plot([], [], "D", color=c, ms=5.5, mec="k",
+                                   mew=0.6, zorder=7, alpha=0.9)[0],
+            "obs_top": ax_top.plot([], [], "D", color=c, ms=5.5, mec="k",
+                                   mew=0.6, zorder=7, alpha=0.9)[0],
+        }
+
+    ax_sky.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    clock = fig.suptitle("", fontsize=12)
+    fig.text(
+        0.5, 0.015,
+        "Dots: fitted orbits.  Diamonds: real measurements, shown from the "
+        "night they were taken.  Lines: the last part of each path.",
+        ha="center", fontsize=8, color="0.35",
+    )
+    fig.tight_layout(rect=(0, 0.035, 1, 0.94))
+
+    def draw(frame):
+        now = times[frame]
+        stamp = start + pd.Timedelta(days=float(now))
+        clock.set_text(f"{parent.capitalize()} system, {year}   "
+                       f"{stamp:%d %b %Y  %H:%M}")
+
+        for moon, tr in tracks.items():
+            a = artists[moon]
+            t_moon = now - tr["offset"]
+            x, y, z = tr["position"](t_moon)
+            a["dot_sky"].set_data(x / scale, y / scale)
+            a["dot_top"].set_data(x / scale, z / scale)
+
+            back = np.linspace(t_moon - min(0.18 * tr["period"], 4.0), t_moon, 30)
+            bx, by, bz = tr["position"](back)
+            a["trail_sky"].set_data(bx / scale, by / scale)
+            a["trail_top"].set_data(bx / scale, bz / scale)
+
+            seen = tr["obs_clock"] <= now
+            _, ox, oy, oz = tr["obs"]
+            a["obs_sky"].set_data(ox[seen] / scale, oy[seen] / scale)
+            a["obs_top"].set_data(ox[seen] / scale, oz[seen] / scale)
+
+        return []
+
+    animation = FuncAnimation(fig, draw, frames=len(times), blit=False)
+
+    for fmt in ANIMATION_FORMATS:
+        target = f"{path_stem}.{fmt}"
+
+        try:
+            if fmt == "gif":
+                animation.save(target, writer=PillowWriter(fps=ANIMATION_FPS), dpi=90)
+            elif fmt == "mp4":
+                if shutil.which("ffmpeg") is None:
+                    print("Skipping mp4: ffmpeg is not installed "
+                          "(the gif was still made).")
+                    continue
+                animation.save(target, writer=FFMpegWriter(fps=ANIMATION_FPS), dpi=110)
+            else:
+                continue
+
+            print(f"Saved animation {target}")
+        except Exception as error:      # an animation must never stop the fit
+            print(f"Could not write {target}: {error}")
+
+    plt.close(fig)
+
+
 def plot_system_view(year_df, fits, parent, year, path):
     """All moons of one planet on a single sky-plane diagram."""
 
@@ -1341,7 +1567,7 @@ FIT_COLUMNS = [
     "next_best_period_days", "next_best_delta_chi2",
     "phase_rad", "chi2_red",
     "ecc_e", "ecc_e_err", "ecc_period_days", "ecc_period_err_days",
-    "ecc_a_arcsec", "ecc_a_km", "ecc_chi2_red", "ecc_delta_chi2",
+    "ecc_a_arcsec", "ecc_a_km", "ecc_a_err_km", "ecc_chi2_red", "ecc_delta_chi2",
     "ecc_p_value",
 ]
 
@@ -1487,6 +1713,7 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                         "ecc_period_err_days": ecc["period_err"],
                         "ecc_a_arcsec": ecc["a"],
                         "ecc_a_km": ecc["a"] * km_per_arcsec,
+                        "ecc_a_err_km": ecc["a_err"] * km_per_arcsec,
                         "ecc_chi2_red": ecc["chi2_red"],
                         "ecc_delta_chi2": ecc["delta_chi2"],
                         "ecc_p_value": ecc["p_value"],
@@ -1537,6 +1764,12 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                     plot_system_3d(
                         groups, fits, parent, year,
                         year_dir / f"{parent}_system3d.png",
+                    )
+
+                if MAKE_ANIMATIONS:
+                    make_orbit_animation(
+                        groups, fits, parent, year,
+                        year_dir / f"{parent}_orbits_animation",
                     )
 
         year_table = pd.DataFrame(year_records).reindex(columns=FIT_COLUMNS)
