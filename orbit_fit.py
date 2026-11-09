@@ -1182,8 +1182,8 @@ def plot_system_3d(groups, fits, parent, year, path):
 
     colours = plt.cm.tab10(np.arange(len(pieces)) % 10)
 
-    fig = plt.figure(figsize=(14, 7))
-    ax3 = fig.add_subplot(1, 2, 1, projection="3d")
+    fig = plt.figure(figsize=(20, 10))
+    ax3 = fig.add_subplot(2, 2, 2, projection="3d")
     ax_sky = fig.add_subplot(2, 4, 3)
     ax_top = fig.add_subplot(2, 4, 4)
     ax_note = fig.add_subplot(2, 2, 4)
