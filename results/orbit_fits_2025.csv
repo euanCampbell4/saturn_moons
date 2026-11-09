@@ -1,6 +1,6 @@
-moon,year,parent,n_images,n_visits,n_nights,status,used_dz_in_fit,a_arcsec,a_err_arcsec,a_km,a_err_km,b_arcsec,b_over_a,b_over_a_err,tilt_deg,psi_deg,psi_err_deg,period_days,period_err_days,period_status,next_best_period_days,next_best_delta_chi2,phase_rad,chi2_red
-dione,2025,saturn,2,2,2,not fitted: too few separate visits,,,,,,,,,,,,,,,,,,
-enceladus,2025,saturn,2,2,2,not fitted: too few separate visits,,,,,,,,,,,,,,,,,,
-rhea,2025,saturn,3,3,3,not fitted: too few separate visits,,,,,,,,,,,,,,,,,,
-tethys,2025,saturn,4,4,4,not fitted: too few separate visits,,,,,,,,,,,,,,,,,,
-titan,2025,saturn,4,4,4,not fitted: too few separate visits,,,,,,,,,,,,,,,,,,
+moon,year,parent,n_images,n_visits,n_nights,status,used_dz_in_fit,a_arcsec,a_err_arcsec,a_km,a_err_km,b_arcsec,b_over_a,b_over_a_err,tilt_deg,psi_deg,psi_err_deg,period_days,period_err_days,period_status,next_best_period_days,next_best_delta_chi2,phase_rad,chi2_red,ecc_e,ecc_e_err,ecc_period_days,ecc_period_err_days,ecc_a_arcsec,ecc_a_km,ecc_chi2_red,ecc_delta_chi2,ecc_p_value
+dione,2025,saturn,2,2,2,not fitted: too few separate visits,,,,,,,,,,,,,,,,,,,,,,,,,,,
+enceladus,2025,saturn,2,2,2,not fitted: too few separate visits,,,,,,,,,,,,,,,,,,,,,,,,,,,
+rhea,2025,saturn,3,3,3,not fitted: too few separate visits,,,,,,,,,,,,,,,,,,,,,,,,,,,
+tethys,2025,saturn,4,4,4,fitted,True,45.77583286864127,0.14612246952376579,294389.8753097338,939.7311394965478,6.763560565931161,0.14775395972236996,0.0064495396343519735,8.496787596224348,-12.15270932531752,0.2743694928972091,1.8872001348593377,7.749315196030512e-05,unique,7.69676448760342,17.042008031003196,1.8027086607076908,37.32452545386866,,,,,,,,,
+titan,2025,saturn,4,4,4,fitted,True,189.18135094256147,0.08368090447993357,1216647.9739369242,538.161940304738,1.3835435163237246,0.007313318725289106,0.0006802595715652512,0.4190260324917719,-4.931540720083999,0.027108662120966402,15.825403380499994,0.0010694656370008216,unique,1.6757265747827448,17.81948825196475,1.7937148129623957,582.9545910551542,,,,,,,,,

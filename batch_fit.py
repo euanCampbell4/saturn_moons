@@ -149,6 +149,7 @@ DIST_UNIT = "auto"                # "auto", "au" or "km"
 # Used for the km conversion and the dz fit when the CSV has no dsat column.
 # One Earth-planet distance in AU per planet (use JPL Horizons "delta" for a
 # typical date), or None. A single number is also accepted.
+NEPTUNE_FALLBACK_AU = 28.9        # used only if Triton rows carry Saturn's distance
 PLANET_DISTANCE_AU = None          # e.g. {"saturn": 9.0, "neptune": 29.0}
 
 # Print additional diagnostics.
@@ -397,9 +398,16 @@ def load_relative_positions():
 
     df["date"] = parsed_dates.dt.strftime("%Y-%m-%d")
 
+    # Tolerate times like "21:10:02 pm": a 24-hour time does not need am/pm.
+    clean_time = (
+        df["time"].astype(str).str.strip()
+        .str.replace(r"(?i)\s*[ap]\.?m\.?$", "", regex=True)
+        .where(lambda t: ~t.str.match(r"(?i)^(0?[1-9]|1[0-2]):.*[ap]\.?m"),
+               df["time"].astype(str).str.strip())
+    )
+
     df["datetime"] = pd.to_datetime(
-        df["date"] + " " + df["time"].astype(str).str.strip(),
-        errors="raise",
+        df["date"] + " " + clean_time, errors="raise",
     )
 
     numeric_columns = [
@@ -410,10 +418,15 @@ def load_relative_positions():
         df[column] = pd.to_numeric(df[column], errors="raise")
 
     # Optional distance columns (see DIST_UNIT).
-    def to_km(column):
-        if column not in df.columns:
+    def to_km(prefix):
+        # Accepts headers such as "dz", "dZ (km)", "dsat", "dSaturn", "dPlanet".
+        names = {"dsat": ("dsat", "dplanet", "dplan", "dist")}.get(prefix, (prefix,))
+        found = [c for c in df.columns if c.startswith(names)]
+
+        if not found:
             return pd.Series(np.nan, index=df.index)
 
+        column = found[0]
         values = pd.to_numeric(df[column], errors="coerce")
         unit = DIST_UNIT.lower()
 
@@ -446,6 +459,31 @@ def load_relative_positions():
             + ", ".join(unknown)
             + ". Add each moon to PARENT_BODY."
         )
+
+    if dsat_from_column:
+        # A moon's distance column must be the distance to ITS planet.
+        # Catch Neptune's moon (Triton) carrying Saturn's distance, which
+        # would make its km scale about three times too small.
+        au = df["dsat_km"] / 1.495978707e8
+        plausible = {"saturn": (8.0, 11.5), "neptune": (28.5, 31.0)}
+
+        for planet, (low, high) in plausible.items():
+            rows = (df["parent"] == planet) & ((au < low) | (au > high))
+
+            if rows.any():
+                fallback = NEPTUNE_FALLBACK_AU if planet == "neptune" else None
+                print(
+                    f"WARNING: {rows.sum()} {planet.capitalize()}-moon row(s) "
+                    f"have a distance of {au[rows].median():.1f} AU, outside "
+                    f"the expected {low}-{high} AU. "
+                    + (f"Using {fallback} AU for them instead; put the "
+                       "Earth-Neptune distance in dSaturn for these rows."
+                       if fallback else
+                       "Check the dSaturn column for these rows.")
+                )
+
+                if fallback:
+                    df.loc[rows, "dsat_km"] = fallback * 1.495978707e8
 
     if not dsat_from_column:
         if isinstance(PLANET_DISTANCE_AU, dict):

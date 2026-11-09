@@ -68,6 +68,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3D projection)
 from scipy.optimize import least_squares, minimize_scalar
+from scipy.stats import f as f_distribution
 
 
 # ============================================================
@@ -111,6 +112,11 @@ MAKE_3D_PLOTS = True
 # "approximate scale" when these are used. Replace with your own values, or
 # add a dSat column to relative_positions.csv for an exact scale.
 FALLBACK_PLANET_DISTANCE_AU = {"saturn": 9.0, "neptune": 29.0}
+
+# Moons that also get an eccentric (Kepler) fit, compared with the circular
+# fit. Titan is the only one whose eccentricity (0.029) is large enough to
+# matter at these measurement errors; the others would be consistent with 0.
+ECCENTRIC_MOONS = {"titan"}
 
 # Equatorial radius of each planet in km, for drawing it to scale in 3D.
 PLANET_RADIUS_KM = {"saturn": 60268.0, "neptune": 24764.0}
@@ -162,8 +168,11 @@ def ensure_distance_columns(df):
     """
 
     def find(prefix):
+        # "dsat" also matches dSaturn; dPlanet / dDist are accepted too.
+        names = ("dsat", "dplanet", "ddist") if prefix == "dsat" else (prefix,)
+
         for column in df.columns:
-            if str(column).lower().replace(" ", "").startswith(prefix):
+            if str(column).lower().replace(" ", "").startswith(names):
                 return column
         return None
 
@@ -230,6 +239,20 @@ def combine_visits(group):
     gaps = group["datetime"].diff().dt.total_seconds().div(60.0).fillna(np.inf)
     visit_id = (gaps > VISIT_GAP_MINUTES).cumsum()
 
+    # The planet's distance changes during the run, and an orbit of fixed
+    # size in km looks bigger on the sky when the planet is closer. To fit
+    # one fixed orbit, every visit is converted to "arcsec at the reference
+    # distance" (the average distance of this moon's data):
+    #     angle_ref = angle_seen * (distance_that_night / reference_distance)
+    # so all three coordinates are proportional to km and the fitted size
+    # is a constant orbit radius.
+    all_ds = (
+        group["dsat_km"].to_numpy(dtype=float)
+        if "dsat_km" in group else np.array([np.nan])
+    )
+    all_ds = all_ds[np.isfinite(all_ds)]
+    d_ref = float(all_ds.mean()) if len(all_ds) else np.nan
+
     rows = []
 
     for _, v in group.groupby(visit_id):
@@ -256,8 +279,17 @@ def combine_visits(group):
         dz = v["dz_km"].to_numpy(dtype=float) if "dz_km" in v else np.array([np.nan])
         ds = v["dsat_km"].to_numpy(dtype=float) if "dsat_km" in v else np.array([np.nan])
 
-        if np.isfinite(dz).any() and np.isfinite(ds).any():
-            record["z"] = float(np.nanmean(dz) / (np.nanmean(ds) / ARCSEC_PER_RAD))
+        if np.isfinite(ds).any() and np.isfinite(d_ref):
+            factor = float(np.nanmean(ds)) / d_ref
+            for key in ("xi", "eta", "sxi", "seta"):
+                record[key] = record[key] * factor
+        record["distance_factor"] = (
+            float(np.nanmean(ds)) / d_ref
+            if np.isfinite(ds).any() and np.isfinite(d_ref) else np.nan
+        )
+
+        if np.isfinite(dz).any() and np.isfinite(d_ref):
+            record["z"] = float(np.nanmean(dz) / (d_ref / ARCSEC_PER_RAD))
         else:
             record["z"] = np.nan
 
@@ -508,6 +540,11 @@ def fit_orbit(vis):
 
     psi_w, phase_w = _wrap(p[2], p[4])
 
+    # _wrap shifts the phase by m*pi, which flips cos(theta) when m is odd,
+    # so the depth sign has to flip with it to describe the same orbit.
+    shift = int(np.floor((p[2] + np.pi / 2) / np.pi))
+    sign_wrapped = sign * (-1.0) ** shift
+
     return {
         "a": p[0], "a_err": err[0],
         "k": p[1], "k_err": err[1],
@@ -519,13 +556,165 @@ def fit_orbit(vis):
         "chi2_red": chi2_red,
         "weighted": weighted,
         "used_dz": use_z,
-        "z_sign": sign,
+        "z_sign": sign_wrapped,
+        "psi_raw": p[2], "phase_raw": p[4], "z_sign_raw": sign,
+        "chi2": chi2, "dof": dof,
         "period_status": period_status,
         "alternatives": alternatives,
         "next_period": next_period,
         "next_delta": next_delta,
         "at_period_bound": at_bound,
     }
+
+
+def kepler_E(mean_anomaly, e):
+    """Solve E - e sin E = M for the eccentric anomaly (Newton iteration)."""
+
+    m = np.mod(mean_anomaly, 2 * np.pi)
+    big_e = m + e * np.sin(m)
+
+    for _ in range(30):
+        big_e = big_e - (big_e - e * np.sin(big_e) - m) / (1 - e * np.cos(big_e))
+
+    return big_e
+
+
+def ecc_model(t, a, e, psi, k, period, m0, omega, sign):
+    """
+    Keplerian orbit with the planet at the focus, seen at tilt k.
+
+    Returns (xi, eta, z) in arcsec-equivalent. For e = 0 it reduces to the
+    circular model above (with omega - m0 = pi/2 - phase).
+    """
+
+    mean = 2 * np.pi * np.asarray(t) / period + m0
+    big_e = kepler_E(mean, e)
+
+    p = a * (np.cos(big_e) - e)                     # towards the closest point
+    q = -a * np.sqrt(1 - e * e) * np.sin(big_e)     # same sense as circular fit
+
+    x1 = p * np.cos(omega) - q * np.sin(omega)      # along the line of nodes
+    x2 = p * np.sin(omega) + q * np.cos(omega)      # across it, in the orbit plane
+
+    xi = x1 * np.cos(psi) - k * x2 * np.sin(psi)
+    eta = x1 * np.sin(psi) + k * x2 * np.cos(psi)
+    z = sign * np.sqrt(max(1.0 - k * k, 0.0)) * x2
+
+    return xi, eta, z
+
+
+def fit_eccentric(vis, circ):
+    """
+    Fit a Kepler orbit (adds eccentricity e, the direction of closest
+    approach and the phase) starting from the circular solution.
+
+    Returns a dict, or None. The period is only allowed to move 5% from the
+    circular fit, so this refines the orbit and cannot jump to an alias.
+    The improvement over the circular fit is judged with an F-test, which
+    does not depend on knowing the absolute size of the errors.
+    """
+
+    t = vis["t"].to_numpy(dtype=float)
+    xi = vis["xi"].to_numpy(dtype=float)
+    eta = vis["eta"].to_numpy(dtype=float)
+    sxi = vis["sxi"].to_numpy(dtype=float)
+    seta = vis["seta"].to_numpy(dtype=float)
+    z = vis["z"].to_numpy(dtype=float)
+
+    n = len(t)
+    use_z = circ["used_dz"]
+    n_coords = 3 if use_z else 2
+    n_par = 7
+    dof = n_coords * n - n_par
+
+    # Seven free parameters need a reasonable number of visits; with fewer
+    # the eccentricity is not constrained and would only be fitting noise.
+    if n < 6 or dof <= 1 or (not use_z and n < 8):
+        return None
+
+    weighted = circ["weighted"]
+    wx = 1.0 / sxi if weighted else np.ones(n)
+    wy = 1.0 / seta if weighted else np.ones(n)
+
+    if use_z:
+        sz = np.hypot(sxi, seta) / np.sqrt(2.0) if weighted else np.ones(n)
+        wz = 1.0 / sz if weighted else np.ones(n)
+
+    period0 = circ["period"]
+    lower = [0.0, 0.0, -np.inf, -1.0, period0 * 0.95, -np.inf, -np.inf]
+    upper = [np.inf, 0.6, np.inf, 1.0, period0 * 1.05, np.inf, np.inf]
+
+    best = None
+
+    for sign in ((1.0, -1.0) if use_z else (1.0,)):
+
+        def residuals(p, sign=sign):
+            a, e, psi, k, period, m0, omega = p
+            mx, my, mz = ecc_model(t, a, e, psi, k, period, m0, omega, sign)
+            parts = [(xi - mx) * wx, (eta - my) * wy]
+
+            if use_z:
+                parts.append((z - mz) * wz)
+
+            return np.concatenate(parts)
+
+        for m0 in np.linspace(0, 2 * np.pi, 8, endpoint=False):
+            for e0 in (0.02, 0.08):
+                omega0 = m0 + np.pi / 2 - circ["phase_raw"]
+                p0 = [circ["a"], e0, circ["psi_raw"], circ["k"],
+                      period0, m0, omega0]
+
+                try:
+                    result = least_squares(
+                        residuals, p0, bounds=(lower, upper), max_nfev=400,
+                    )
+                except (ValueError, RuntimeError):
+                    continue
+
+                if best is None or result.cost < best[0].cost:
+                    best = (result, sign)
+
+    if best is None:
+        return None
+
+    result, sign = best
+    p = result.x
+    chi2 = float(np.sum(result.fun ** 2))
+    chi2_red = chi2 / dof
+
+    cov = np.linalg.pinv(result.jac.T @ result.jac)
+    # Conservative: if the model does not fit within the stated errors,
+    # inflate the parameter errors by the misfit.
+    cov = cov * max(chi2_red, 1.0 if weighted else 1e-12) if weighted else cov * chi2_red
+    err = np.sqrt(np.maximum(np.diag(cov), 0.0))
+
+    delta = circ["chi2"] - chi2
+    extra = n_par - 5
+
+    if delta > 0 and chi2 > 0:
+        f_value = (delta / extra) / (chi2 / dof)
+        p_value = float(f_distribution.sf(f_value, extra, dof))
+    else:
+        p_value = 1.0
+
+    return {
+        "a": p[0], "a_err": err[0],
+        "e": p[1], "e_err": err[1],
+        "psi": p[2], "k": p[3],
+        "period": p[4], "period_err": err[4],
+        "m0": p[5], "omega": p[6], "sign": sign,
+        "chi2": chi2, "chi2_red": chi2_red, "dof": dof,
+        "delta_chi2": float(delta), "p_value": p_value,
+    }
+
+
+def ecc_xyz(ecc, t):
+    """Eccentric-fit position (xi, eta, z), arcsec-equivalent."""
+
+    return ecc_model(
+        t, ecc["a"], ecc["e"], ecc["psi"], ecc["k"], ecc["period"],
+        ecc["m0"], ecc["omega"], ecc["sign"],
+    )
 
 
 def model_from_fit(fit, t):
@@ -591,6 +780,13 @@ def plot_moon_year(group, fit, moon, year, parent, origin, path):
         for x1, y1, x2, y2 in zip(xi, eta, mx, my):
             ax_sky.plot([x1, x2], [y1, y2], "-", color="tab:red", lw=0.8)
 
+    ecc = fit.get("ecc") if fit is not None else None
+
+    if ecc is not None:
+        ex2, ey2, _ = ecc_xyz(ecc, np.linspace(0, ecc["period"], 600))
+        ax_sky.plot(ex2, ey2, "-", color="tab:orange", lw=1.4,
+                    label=f"Eccentric fit (e = {ecc['e']:.3f})")
+
     ax_sky.set_title("Orbit on the sky (equal scale)")
     _sky_axes_labels(ax_sky)
     ax_sky.legend(fontsize=8, loc="upper right")
@@ -636,8 +832,14 @@ def plot_moon_year(group, fit, moon, year, parent, origin, path):
         if fit is not None:
             ax.plot(
                 tg, model_from_fit(fit, tg)[comp], "-", color="tab:red",
-                label="Model",
+                label="Circular model",
             )
+
+            if ecc is not None:
+                ax.plot(
+                    tg, ecc_xyz(ecc, tg)[comp], "-", color="tab:orange",
+                    label="Eccentric model",
+                )
         ax.axhline(0, color="0.5", lw=0.8)
         ax.set_xlabel("Days since first image")
         ax.set_ylabel(name)
@@ -713,8 +915,14 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
     km = distance_km / ARCSEC_PER_RAD     # km per arcsecond
 
     good = np.isfinite(group["dz_km"].to_numpy(dtype=float))
-    obs_x = group["sky_x_arcsec"].to_numpy(dtype=float)[good] * km
-    obs_y = group["sky_y_arcsec"].to_numpy(dtype=float)[good] * km
+    # Each image uses the planet's distance on its own night.
+    if "dsat_km" in group:
+        km_each = group["dsat_km"].to_numpy(dtype=float)[good] / ARCSEC_PER_RAD
+        km_each = np.where(np.isfinite(km_each), km_each, km)
+    else:
+        km_each = km
+    obs_x = group["sky_x_arcsec"].to_numpy(dtype=float)[good] * km_each
+    obs_y = group["sky_y_arcsec"].to_numpy(dtype=float)[good] * km_each
     obs_z = group["dz_km"].to_numpy(dtype=float)[good]
     obs_t = group["t"].to_numpy(dtype=float)[good]
 
@@ -748,10 +956,19 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
         )
         curve = (cx * km, cy * km, cz * km)
 
+    ecc_curve = None
+    ecc = fit.get("ecc") if fit is not None else None
+
+    if ecc is not None:
+        ex, ey, ez = ecc_xyz(ecc, np.linspace(0, ecc["period"], 600))
+        ecc_curve = (ex * km, ey * km, ez * km)
+
     # Equal-scale limits in all three directions.
     pieces = [obs_x, obs_y, obs_z]
     if curve is not None:
         pieces += list(curve)
+    if ecc_curve is not None:
+        pieces += list(ecc_curve)
     radius = 1.08 * max(float(np.max(np.abs(a))) for a in pieces)
 
     fig = plt.figure(figsize=(13, 10))
@@ -772,6 +989,12 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
             curve[0] / scale, curve[1] / scale, curve[2] / scale,
             "--", color="tab:red", lw=1.2, label="Fitted orbit",
         )
+    if ecc_curve is not None:
+        ax3.plot(
+            ecc_curve[0] / scale, ecc_curve[1] / scale, ecc_curve[2] / scale,
+            "-", color="tab:orange", lw=1.4,
+            label=f"Eccentric fit (e = {ecc['e']:.3f})",
+        )
     ax3.scatter([0], [0], [0], color="gold", edgecolor="k", s=140,
                 label=parent.capitalize())
     ax3.plot([0, 0], [0, 0], [0, radius / scale], color="0.4", lw=1)
@@ -787,11 +1010,14 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
     ax3.legend(fontsize=7, loc="upper left")
     ax3.set_title("3D orbit")
 
-    def panel(ax, xs, ys, cxs, cys, xlabel, ylabel, title):
+    def panel(ax, xs, ys, cxs, cys, xlabel, ylabel, title, ecc_xy=None):
         ax.scatter(xs / scale, ys / scale, c=obs_t, cmap="viridis", s=34,
                    zorder=3)
         if cxs is not None:
             ax.plot(cxs / scale, cys / scale, "--", color="tab:red", lw=1.2)
+        if ecc_xy is not None:
+            ax.plot(ecc_xy[0] / scale, ecc_xy[1] / scale, "-",
+                    color="tab:orange", lw=1.4)
         ax.plot(0, 0, "o", color="gold", mec="k", ms=11, zorder=4)
         ax.set_xlim(-radius / scale, radius / scale)
         ax.set_ylim(-radius / scale, radius / scale)
@@ -803,14 +1029,19 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
 
     cxk, cyk, czk = curve if curve is not None else (None, None, None)
 
+    ec = ecc_curve
+
     panel(ax_sky, obs_x, obs_y, cxk, cyk,
-          "East (10$^6$ km)", "North (10$^6$ km)", "View from Earth")
+          "East (10$^6$ km)", "North (10$^6$ km)", "View from Earth",
+          None if ec is None else (ec[0], ec[1]))
     panel(ax_top, obs_x, obs_z, cxk, czk,
           "East (10$^6$ km)", "Towards Earth (10$^6$ km)",
-          "View from above (east vs depth)")
+          "East vs depth (closest to a top-down view)",
+          None if ec is None else (ec[0], ec[2]))
     panel(ax_side, obs_y, obs_z, cyk, czk,
           "North (10$^6$ km)", "Towards Earth (10$^6$ km)",
-          "Side view (north vs depth)")
+          "Side view (north vs depth)",
+          None if ec is None else (ec[1], ec[2]))
     ax_top.invert_xaxis()
 
     title = f"{moon.capitalize()} {year}: orbit around {parent.capitalize()}"
@@ -861,12 +1092,19 @@ def _geometry_km(group, fit, parent):
     km = distance_km / ARCSEC_PER_RAD
 
     good = np.isfinite(group["dz_km"].to_numpy(dtype=float))
-    obs_x = group["sky_x_arcsec"].to_numpy(dtype=float)[good] * km
-    obs_y = group["sky_y_arcsec"].to_numpy(dtype=float)[good] * km
+    # Each image uses the planet's distance on its own night.
+    if "dsat_km" in group:
+        km_each = group["dsat_km"].to_numpy(dtype=float)[good] / ARCSEC_PER_RAD
+        km_each = np.where(np.isfinite(km_each), km_each, km)
+    else:
+        km_each = km
+    obs_x = group["sky_x_arcsec"].to_numpy(dtype=float)[good] * km_each
+    obs_y = group["sky_y_arcsec"].to_numpy(dtype=float)[good] * km_each
     obs_z = group["dz_km"].to_numpy(dtype=float)[good]
     obs_t = group["t"].to_numpy(dtype=float)[good]
 
     curve = None
+    ecc_curve = None
 
     if fit is not None:
         tt = np.linspace(0, fit["period"], 600)
@@ -891,7 +1129,12 @@ def _geometry_km(group, fit, parent):
         )
         curve = (cx * km, cy * km, cz * km)
 
-    return obs_x, obs_y, obs_z, obs_t, curve, approximate
+        if fit.get("ecc") is not None:
+            ecc = fit["ecc"]
+            ex, ey, ez = ecc_xyz(ecc, np.linspace(0, ecc["period"], 600))
+            ecc_curve = (ex * km, ey * km, ez * km)
+
+    return obs_x, obs_y, obs_z, obs_t, curve, approximate, ecc_curve
 
 
 def plot_system_3d(groups, fits, parent, year, path):
@@ -927,10 +1170,12 @@ def plot_system_3d(groups, fits, parent, year, path):
 
     arrays = []
 
-    for obs_x, obs_y, obs_z, _, curve, _ in pieces.values():
+    for obs_x, obs_y, obs_z, _, curve, _, ecc_c in pieces.values():
         arrays += [obs_x, obs_y, obs_z]
         if curve is not None:
             arrays += list(curve)
+        if ecc_c is not None:
+            arrays += list(ecc_c)
 
     radius = 1.08 * max(float(np.max(np.abs(a))) for a in arrays)
     scale = 1e6
@@ -956,7 +1201,7 @@ def plot_system_3d(groups, fits, parent, year, path):
         )
 
     for colour, (moon, geom) in zip(colours, pieces.items()):
-        obs_x, obs_y, obs_z, _, curve, _ = geom
+        obs_x, obs_y, obs_z, _, curve, _, ecc_c = geom
 
         ax3.scatter(
             obs_x / scale, obs_y / scale, obs_z / scale,
@@ -974,6 +1219,16 @@ def plot_system_3d(groups, fits, parent, year, path):
                         color=colour, lw=0.9)
             ax_top.plot(curve[0] / scale, curve[2] / scale, "--",
                         color=colour, lw=0.9)
+
+        if ecc_c is not None:
+            # Same curve as in the moon's own plot: circular fit dashed,
+            # eccentric fit solid.
+            ax3.plot(ecc_c[0] / scale, ecc_c[1] / scale, ecc_c[2] / scale,
+                     "-", color=colour, lw=1.6)
+            ax_sky.plot(ecc_c[0] / scale, ecc_c[1] / scale, "-",
+                        color=colour, lw=1.3)
+            ax_top.plot(ecc_c[0] / scale, ecc_c[2] / scale, "-",
+                        color=colour, lw=1.3)
 
     ax3.plot([0, 0], [0, 0], [0, radius / scale], color="0.4", lw=1)
     ax3.text(0, 0, radius / scale, " to Earth", fontsize=8)
@@ -1015,6 +1270,13 @@ def plot_system_3d(groups, fits, parent, year, path):
                 f"{moon.capitalize()}: P = {fit['period']:.3f} d "
                 f"({fit['period_status']})"
             )
+            ecc = fit.get("ecc")
+
+            if ecc is not None:
+                lines.append(
+                    f"   eccentric fit: P = {ecc['period']:.3f} d, "
+                    f"e = {ecc['e']:.3f}  (solid line; dashed = circular)"
+                )
 
     ax_note.text(0.0, 1.0, "\n".join(lines), va="top", fontsize=9,
                  family="monospace")
@@ -1078,6 +1340,9 @@ FIT_COLUMNS = [
     "period_days", "period_err_days", "period_status",
     "next_best_period_days", "next_best_delta_chi2",
     "phase_rad", "chi2_red",
+    "ecc_e", "ecc_e_err", "ecc_period_days", "ecc_period_err_days",
+    "ecc_a_arcsec", "ecc_a_km", "ecc_chi2_red", "ecc_delta_chi2",
+    "ecc_p_value",
 ]
 
 
@@ -1141,6 +1406,10 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
 
             visits = combine_visits(group)
             fit = fit_orbit(visits)
+
+            if fit is not None and moon in ECCENTRIC_MOONS:
+                fit["ecc"] = fit_eccentric(visits, fit)
+
             fits[moon] = fit
             groups[moon] = group
 
@@ -1207,6 +1476,34 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                     "phase_rad": fit["phase"],
                     "chi2_red": fit["chi2_red"],
                 })
+
+                ecc = fit.get("ecc")
+
+                if ecc is not None:
+                    record.update({
+                        "ecc_e": ecc["e"],
+                        "ecc_e_err": ecc["e_err"],
+                        "ecc_period_days": ecc["period"],
+                        "ecc_period_err_days": ecc["period_err"],
+                        "ecc_a_arcsec": ecc["a"],
+                        "ecc_a_km": ecc["a"] * km_per_arcsec,
+                        "ecc_chi2_red": ecc["chi2_red"],
+                        "ecc_delta_chi2": ecc["delta_chi2"],
+                        "ecc_p_value": ecc["p_value"],
+                    })
+
+                    verdict = (
+                        "significantly better than circular"
+                        if ecc["p_value"] < 0.05
+                        else "not significantly better than circular"
+                    )
+                    print(
+                        f"   {moon} {year} eccentric fit: e = {ecc['e']:.4f} "
+                        f"+/- {ecc['e_err']:.4f}, P = {ecc['period']:.3f} d, "
+                        f"chi2_red {fit['chi2_red']:.1f} -> "
+                        f"{ecc['chi2_red']:.1f}, F-test p = "
+                        f"{ecc['p_value']:.3g} ({verdict})"
+                    )
 
                 print(
                     f"{moon} {year}: a = {fit['a']:.2f}\", "
