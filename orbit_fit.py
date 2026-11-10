@@ -1485,7 +1485,7 @@ def make_orbit_animation(groups, fits, parent, year, path_stem):
     ax_sky.set_ylabel(f"North ({unit})")
     ax_sky.set_title("View from Earth")
 
-    ax_top.set_xlim(reach / scale, -reach / scale)      # east to the left
+    ax_top.set_xlim(-reach / scale, reach / scale)      # same east direction as the left panel
     ax_top.set_ylim(-reach / scale, reach / scale)
     ax_top.set_xlabel(f"East ({unit})")
     ax_top.set_ylabel(f"Towards Earth ({unit})")
@@ -1514,7 +1514,10 @@ def make_orbit_animation(groups, fits, parent, year, path_stem):
                                    mew=0.6, zorder=7, alpha=0.9)[0],
         }
 
-    ax_sky.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    fig.legend(
+        *ax_sky.get_legend_handles_labels(), loc="upper center",
+        bbox_to_anchor=(0.5, 0.945), ncol=len(tracks), fontsize=9, frameon=False,
+    )
     clock = fig.suptitle("", fontsize=12)
     fig.text(
         0.5, 0.015,
@@ -1522,7 +1525,7 @@ def make_orbit_animation(groups, fits, parent, year, path_stem):
         "night they were taken.  Lines: the last part of each path.",
         ha="center", fontsize=8, color="0.35",
     )
-    fig.tight_layout(rect=(0, 0.035, 1, 0.94))
+    fig.tight_layout(rect=(0, 0.035, 1, 0.90))
 
     def draw(frame):
         now = times[frame]
