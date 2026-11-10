@@ -107,13 +107,6 @@ EXTEND_MODEL_TO_FULL_PERIOD = True
 # 3D orbit diagrams (one extra figure per moon and year).
 MAKE_3D_PLOTS = True
 
-# Direction check. All of a planet's regular moons orbit the same way (the
-# same direction as the planet spins), so an orbit that runs the opposite way
-# to the others is almost certainly an aliased period. A fit counts as
-# "agreeing" if its orbital pole is within this angle of the common one.
-CHECK_DIRECTION = True
-DIRECTION_TOLERANCE_DEG = 60.0
-
 # Animation of the fitted orbits moving through the observing period, with
 # each real measurement appearing on the night it was taken.
 MAKE_ANIMATIONS = True
@@ -377,55 +370,12 @@ def candidate_periods(t, series, weights):
 # FIT
 # ============================================================
 
-def _pole_vector(a, k, psi, period, phase, sign):
-    """
-    Unit vector along the orbit's angular momentum (the orbital pole) in
-    (east, north, towards Earth). Two orbits run the same way round the planet
-    if their poles point the same way.
-    """
-
-    tt = np.linspace(0.0, period, 240, endpoint=False)
-    x, y = ellipse_model(tt, a, k, psi, period, phase, 0.0, 0.0)
-    z = depth_model(tt, a, k, period, phase, sign)
-    r = np.column_stack([x, y, z])
-    step = tt[1] - tt[0]
-    v = (np.roll(r, -1, axis=0) - np.roll(r, 1, axis=0)) / (2 * step)
-    ang = np.mean(np.cross(r, v), axis=0)
-    norm = np.linalg.norm(ang)
-
-    return ang / norm if norm > 0 else ang
-
-
-def _direction_agrees(pole, used_dz, reference):
-    """
-    True / False, or None when it cannot be told.
-    With dz the whole 3D pole is compared. Without dz only the sense of
-    rotation on the sky (the component towards Earth) is known.
-    """
-
-    if reference is None:
-        return None
-
-    if used_dz:
-        cosine = float(np.clip(np.dot(pole, reference), -1, 1))
-        return bool(np.degrees(np.arccos(cosine)) < DIRECTION_TOLERANCE_DEG)
-
-    if abs(pole[2]) < 0.1 or abs(reference[2]) < 0.1:
-        return None
-
-    return bool(np.sign(pole[2]) == np.sign(reference[2]))
-
-
-def fit_orbit(vis, required_pole=None):
+def fit_orbit(vis):
     """
     Weighted least-squares fit of the projected ellipse to the visits.
 
     `vis` is the table from combine_visits(). Returns a dict, or None if the
     data cannot support a fit.
-
-    `required_pole` (optional): unit vector (east, north, towards Earth) of the
-    orbital pole shared by the planet's other moons. Candidate orbits running
-    the opposite way are discarded, which removes aliased solutions.
     """
 
     t = vis["t"].to_numpy(dtype=float)
@@ -538,12 +488,6 @@ def fit_orbit(vis, required_pole=None):
                 except (ValueError, RuntimeError):
                     continue
 
-                if required_pole is not None:
-                    x = result.x
-                    pole = _pole_vector(x[0], x[1], x[2], x[3], x[4], sign)
-                    if _direction_agrees(pole, use_z, required_pole) is False:
-                        continue
-
                 if best_here is None or result.cost < best_here[0].cost:
                     best_here = (result, sign)
 
@@ -622,7 +566,6 @@ def fit_orbit(vis, required_pole=None):
         "z_sign": sign_wrapped,
         "psi_raw": p[2], "phase_raw": p[4], "z_sign_raw": sign,
         "chi2": chi2, "dof": dof,
-        "pole": _pole_vector(p[0], p[1], p[2], p[3], p[4], sign),
         "period_status": period_status,
         "alternatives": alternatives,
         "next_period": next_period,
@@ -1485,7 +1428,7 @@ def make_orbit_animation(groups, fits, parent, year, path_stem):
     ax_sky.set_ylabel(f"North ({unit})")
     ax_sky.set_title("View from Earth")
 
-    ax_top.set_xlim(-reach / scale, reach / scale)      # same east direction as the left panel
+    ax_top.set_xlim(reach / scale, -reach / scale)      # east to the left
     ax_top.set_ylim(-reach / scale, reach / scale)
     ax_top.set_xlabel(f"East ({unit})")
     ax_top.set_ylabel(f"Towards Earth ({unit})")
@@ -1514,10 +1457,7 @@ def make_orbit_animation(groups, fits, parent, year, path_stem):
                                    mew=0.6, zorder=7, alpha=0.9)[0],
         }
 
-    fig.legend(
-        *ax_sky.get_legend_handles_labels(), loc="upper center",
-        bbox_to_anchor=(0.5, 0.945), ncol=len(tracks), fontsize=9, frameon=False,
-    )
+    ax_sky.legend(loc="upper right", fontsize=8, framealpha=0.9)
     clock = fig.suptitle("", fontsize=12)
     fig.text(
         0.5, 0.015,
@@ -1525,7 +1465,7 @@ def make_orbit_animation(groups, fits, parent, year, path_stem):
         "night they were taken.  Lines: the last part of each path.",
         ha="center", fontsize=8, color="0.35",
     )
-    fig.tight_layout(rect=(0, 0.035, 1, 0.90))
+    fig.tight_layout(rect=(0, 0.035, 1, 0.94))
 
     def draw(frame):
         now = times[frame]
@@ -1620,7 +1560,6 @@ PARENT_BODY_LOOKUP = {}
 
 FIT_COLUMNS = [
     "moon", "year", "parent", "n_images", "n_visits", "n_nights", "status",
-    "direction_check",
     "used_dz_in_fit", "a_arcsec", "a_err_arcsec", "a_km", "a_err_km",
     "b_arcsec", "b_over_a", "b_over_a_err",
     "tilt_deg", "psi_deg", "psi_err_deg",
@@ -1631,47 +1570,6 @@ FIT_COLUMNS = [
     "ecc_a_arcsec", "ecc_a_km", "ecc_a_err_km", "ecc_chi2_red", "ecc_delta_chi2",
     "ecc_p_value",
 ]
-
-
-def _direction_references(prepared, parent_body, year):
-    """
-    The orbital pole shared by most of each planet's moons (needs dz, so that
-    the pole is known in 3D). The pole is the average of the moons that agree
-    with each other; if two candidates tie, the one with the larger orbit
-    (longer period, so less prone to aliasing) wins.
-    """
-
-    references = {}
-    by_parent = {}
-
-    for moon, (_, _, fit) in prepared.items():
-        if fit is not None and fit["used_dz"]:
-            by_parent.setdefault(parent_body.get(moon, "planet"), []).append((moon, fit))
-
-    for parent, entries in by_parent.items():
-        if len(entries) < 2:
-            continue
-
-        tol = np.cos(np.radians(DIRECTION_TOLERANCE_DEG))
-        best = None
-
-        for moon_i, fit_i in entries:
-            group = [
-                (m, f) for m, f in entries
-                if float(np.dot(f["pole"], fit_i["pole"])) > tol
-            ]
-            rank = (len(group), fit_i["a"])
-
-            if best is None or rank > best[0]:
-                best = (rank, group)
-
-        group = best[1]
-        mean_pole = np.mean([f["pole"] for _, f in group], axis=0)
-        references[parent] = mean_pole / np.linalg.norm(mean_pole)
-        names = ", ".join(m for m, _ in group)
-        print(f"Direction check {parent} {year}: common orbital direction set by {names}.")
-
-    return references
 
 
 def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
@@ -1721,66 +1619,19 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
         groups = {}
         year_records = []
 
-        # First pass: fit every moon on its own.
-        prepared = {}
-
         for moon, group in year_df.groupby("moon"):
             group = group.sort_values("datetime").copy()
+
             origin = group["datetime"].min()
             group["t"] = (
                 (group["datetime"] - origin).dt.total_seconds() / 86400.0
             )
-            visits = combine_visits(group)
-            prepared[moon] = (group, visits, fit_orbit(visits))
 
-        # Second pass: all moons of one planet must orbit the same way.
-        direction_notes = {moon: "not checked" for moon in prepared}
-
-        if CHECK_DIRECTION:
-            references = _direction_references(prepared, parent_body, year)
-
-            for moon, (group, visits, fit) in list(prepared.items()):
-                if fit is None:
-                    continue
-
-                parent = parent_body.get(moon, "planet")
-                reference = references.get(parent)
-                verdict = _direction_agrees(fit["pole"], fit["used_dz"], reference)
-
-                if verdict is True:
-                    direction_notes[moon] = "agrees with the other moons"
-                elif verdict is False:
-                    old_period = fit["period"]
-                    corrected = fit_orbit(visits, required_pole=reference)
-
-                    if corrected is not None:
-                        prepared[moon] = (group, visits, corrected)
-                        direction_notes[moon] = (
-                            f"opposite direction at P = {old_period:.3f} d; "
-                            "refitted with the common direction"
-                        )
-                        print(
-                            f"Direction check: {moon} {year} ran the opposite way to the "
-                            f"other moons at P = {old_period:.3f} d (probably an alias). "
-                            f"Refitted with the common direction: P = {corrected['period']:.4f} d "
-                            f"({corrected['period_status']}, chi2_red {fit['chi2_red']:.1f} -> "
-                            f"{corrected['chi2_red']:.1f})."
-                        )
-                    else:
-                        fit["period_status"] = (
-                            "ambiguous (runs opposite to the other moons: probable alias)"
-                        )
-                        direction_notes[moon] = "opposite direction, could not be corrected"
-                        print(
-                            f"Direction check: {moon} {year} runs the opposite way to the "
-                            f"other moons and no period with the right direction fits; "
-                            "marked ambiguous."
-                        )
-
-        for moon, (group, visits, fit) in prepared.items():
-            origin = group["datetime"].min()
             n_nights = int(group["datetime"].dt.normalize().nunique())
             parent = parent_body.get(moon, "planet")
+
+            visits = combine_visits(group)
+            fit = fit_orbit(visits)
 
             if fit is not None and moon in ECCENTRIC_MOONS:
                 fit["ecc"] = fit_eccentric(visits, fit)
@@ -1792,7 +1643,6 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                 "moon": moon, "year": year, "parent": parent,
                 "n_images": len(group), "n_visits": len(visits),
                 "n_nights": n_nights,
-                "direction_check": direction_notes.get(moon, "not checked"),
             }
 
             if fit is None:
