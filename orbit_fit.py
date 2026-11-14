@@ -107,6 +107,31 @@ EXTEND_MODEL_TO_FULL_PERIOD = True
 # 3D orbit diagrams (one extra figure per moon and year).
 MAKE_3D_PLOTS = True
 
+# Error bars on the plots.
+# East and north errors come from the measured centroid errors.
+# Depth (dz) comes from an ephemeris, so it has no measured error: leave this
+# as None to draw no depth error bars, or give your own estimate in km
+# (for example the change in dz over your timing uncertainty).
+DZ_ERROR_KM = None
+ERRORBAR_COLOUR = "0.25"
+
+# The errors are thousands of km on orbits a million km across, so at true
+# size the bars hide behind the points. Two ways to make them visible:
+#  1. Magnify the bars on the orbit plots. "auto" picks a round factor so a
+#     typical bar is about 4% of the plot width; a number sets it yourself;
+#     1 draws them at true size. The factor is always written on the plot.
+#  2. A separate residual plot per moon (measured minus fitted position),
+#     where the bars are drawn at TRUE size on a zoomed-in scale.
+ERRORBAR_MAGNIFY = "auto"
+MAKE_RESIDUAL_PLOTS = True
+
+# Direction check. All of a planet's regular moons orbit the same way (the
+# same direction as the planet spins), so an orbit that runs the opposite way
+# to the others is almost certainly an aliased period. A fit counts as
+# "agreeing" if its orbital pole is within this angle of the common one.
+CHECK_DIRECTION = True
+DIRECTION_TOLERANCE_DEG = 60.0
+
 # Animation of the fitted orbits moving through the observing period, with
 # each real measurement appearing on the night it was taken.
 MAKE_ANIMATIONS = True
@@ -370,12 +395,55 @@ def candidate_periods(t, series, weights):
 # FIT
 # ============================================================
 
-def fit_orbit(vis):
+def _pole_vector(a, k, psi, period, phase, sign):
+    """
+    Unit vector along the orbit's angular momentum (the orbital pole) in
+    (east, north, towards Earth). Two orbits run the same way round the planet
+    if their poles point the same way.
+    """
+
+    tt = np.linspace(0.0, period, 240, endpoint=False)
+    x, y = ellipse_model(tt, a, k, psi, period, phase, 0.0, 0.0)
+    z = depth_model(tt, a, k, period, phase, sign)
+    r = np.column_stack([x, y, z])
+    step = tt[1] - tt[0]
+    v = (np.roll(r, -1, axis=0) - np.roll(r, 1, axis=0)) / (2 * step)
+    ang = np.mean(np.cross(r, v), axis=0)
+    norm = np.linalg.norm(ang)
+
+    return ang / norm if norm > 0 else ang
+
+
+def _direction_agrees(pole, used_dz, reference):
+    """
+    True / False, or None when it cannot be told.
+    With dz the whole 3D pole is compared. Without dz only the sense of
+    rotation on the sky (the component towards Earth) is known.
+    """
+
+    if reference is None:
+        return None
+
+    if used_dz:
+        cosine = float(np.clip(np.dot(pole, reference), -1, 1))
+        return bool(np.degrees(np.arccos(cosine)) < DIRECTION_TOLERANCE_DEG)
+
+    if abs(pole[2]) < 0.1 or abs(reference[2]) < 0.1:
+        return None
+
+    return bool(np.sign(pole[2]) == np.sign(reference[2]))
+
+
+def fit_orbit(vis, required_pole=None):
     """
     Weighted least-squares fit of the projected ellipse to the visits.
 
     `vis` is the table from combine_visits(). Returns a dict, or None if the
     data cannot support a fit.
+
+    `required_pole` (optional): unit vector (east, north, towards Earth) of the
+    orbital pole shared by the planet's other moons. Candidate orbits running
+    the opposite way are discarded, which removes aliased solutions.
     """
 
     t = vis["t"].to_numpy(dtype=float)
@@ -488,6 +556,12 @@ def fit_orbit(vis):
                 except (ValueError, RuntimeError):
                     continue
 
+                if required_pole is not None:
+                    x = result.x
+                    pole = _pole_vector(x[0], x[1], x[2], x[3], x[4], sign)
+                    if _direction_agrees(pole, use_z, required_pole) is False:
+                        continue
+
                 if best_here is None or result.cost < best_here[0].cost:
                     best_here = (result, sign)
 
@@ -566,6 +640,7 @@ def fit_orbit(vis):
         "z_sign": sign_wrapped,
         "psi_raw": p[2], "phase_raw": p[4], "z_sign_raw": sign,
         "chi2": chi2, "dof": dof,
+        "pole": _pole_vector(p[0], p[1], p[2], p[3], p[4], sign),
         "period_status": period_status,
         "alternatives": alternatives,
         "next_period": next_period,
@@ -877,6 +952,235 @@ def plot_moon_year(group, fit, moon, year, parent, origin, path):
     plt.close(fig)
 
 
+def _errors_km(group, parent):
+    """
+    Error bars (east, north, depth) in km for the images that have dz,
+    in the same order as the observed points on the 3D plots.
+    Returns None if the moon has no dz values. Missing errors are NaN.
+    """
+
+    if "dz_km" not in group or not np.isfinite(group["dz_km"]).any():
+        return None
+
+    good = np.isfinite(group["dz_km"].to_numpy(dtype=float))
+
+    dsat = (
+        group["dsat_km"].to_numpy(dtype=float)
+        if "dsat_km" in group else np.full(len(group), np.nan)
+    )
+    finite = dsat[np.isfinite(dsat)]
+
+    if len(finite):
+        fallback = float(finite.mean())
+    else:
+        au = FALLBACK_PLANET_DISTANCE_AU.get(parent)
+        if au is None:
+            return None
+        fallback = au * 1.495978707e8
+
+    km_each = np.where(np.isfinite(dsat), dsat, fallback)[good] / ARCSEC_PER_RAD
+    sx, sy = sky_errors(group)
+    ex = sx[good] * km_each
+    ey = sy[good] * km_each
+    ez = np.full(int(good.sum()), np.nan if DZ_ERROR_KM is None else float(DZ_ERROR_KM))
+
+    return ex, ey, ez
+
+
+def _bars(values):
+    """Error array for matplotlib: None if nothing usable, NaN drawn as zero."""
+
+    if values is None or not np.isfinite(values).any():
+        return None
+
+    return np.where(np.isfinite(values), values, 0.0)
+
+
+def _error_note(ex, ey, ez):
+    """One line saying how big the error bars are (they are often tiny)."""
+
+    parts = []
+
+    for name, values in (("east", ex), ("north", ey)):
+        if values is not None and np.isfinite(values).any():
+            parts.append(f"{name} ±{np.nanmedian(values):,.0f} km")
+
+    if ez is not None and np.isfinite(ez).any():
+        parts.append(f"depth ±{np.nanmedian(ez):,.0f} km")
+    else:
+        parts.append("depth: from ephemeris, no measured error")
+
+    if not parts:
+        return ""
+
+    return "Typical error bars: " + ", ".join(parts)
+
+
+def _magnification(error_arrays, radius):
+    """Round factor by which error bars are drawn larger than life."""
+
+    if ERRORBAR_MAGNIFY != "auto":
+        return max(float(ERRORBAR_MAGNIFY), 1.0)
+
+    values = [
+        v[np.isfinite(v) & (v > 0)] for v in error_arrays if v is not None
+    ]
+    values = [v for v in values if len(v)]
+
+    if not values:
+        return 1.0
+
+    typical = float(np.median(np.concatenate(values)))
+    wanted = 0.04 * radius / typical
+
+    for nice in (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000):
+        if nice >= wanted:
+            return float(nice)
+
+    return 1000.0
+
+
+def _magnify_text(factor):
+    if factor <= 1:
+        return "Error bars at true size."
+    return f"Error bars drawn x{factor:g} so they can be seen."
+
+
+def plot_residuals(group, fit, moon, year, parent, path):
+    """
+    Measured minus fitted position for every image, in km, with the error
+    bars at true size. On this zoomed-in scale the errors are visible, and it
+    shows directly whether the points agree with the orbit within them.
+    """
+
+    if fit is None:
+        return
+
+    dsat = (
+        group["dsat_km"].to_numpy(dtype=float)
+        if "dsat_km" in group else np.full(len(group), np.nan)
+    )
+    finite = dsat[np.isfinite(dsat)]
+
+    if len(finite):
+        d_ref = float(finite.mean())
+    else:
+        au = FALLBACK_PLANET_DISTANCE_AU.get(parent)
+        if au is None:
+            print(f"No residual plot for {moon} {year}: planet distance unknown.")
+            return
+        d_ref = au * 1.495978707e8
+
+    km_ref = d_ref / ARCSEC_PER_RAD
+    km_each = np.where(np.isfinite(dsat), dsat, d_ref) / ARCSEC_PER_RAD
+
+    t = group["t"].to_numpy(dtype=float)
+    obs_x = group["sky_x_arcsec"].to_numpy(dtype=float) * km_each
+    obs_y = group["sky_y_arcsec"].to_numpy(dtype=float) * km_each
+    obs_z = (
+        group["dz_km"].to_numpy(dtype=float)
+        if "dz_km" in group else np.full(len(group), np.nan)
+    )
+    sx, sy = sky_errors(group)
+    err_x, err_y = sx * km_each, sy * km_each
+    err_z = np.full(len(group), np.nan if DZ_ERROR_KM is None else float(DZ_ERROR_KM))
+
+    ecc = fit.get("ecc")
+
+    if ecc is not None:
+        mx, my, mz = ecc_xyz(ecc, t)
+        model_name = f"eccentric fit (e = {ecc['e']:.3f})"
+    else:
+        mx, my = model_from_fit(fit, t)
+        sign = fit["z_sign"]
+
+        if not fit["used_dz"] and np.isfinite(obs_z).any():
+            ok = np.isfinite(obs_z)
+            trials = [
+                (np.sum((obs_z[ok] / km_ref - depth_model(
+                    t[ok], fit["a"], fit["k"], fit["period"], fit["phase"], tr
+                )) ** 2), tr)
+                for tr in (1.0, -1.0)
+            ]
+            sign = min(trials)[1]
+
+        mz = depth_model(t, fit["a"], fit["k"], fit["period"], fit["phase"], sign)
+        model_name = "circular fit"
+
+    res = [obs_x - mx * km_ref, obs_y - my * km_ref, obs_z - mz * km_ref]
+    errs = [err_x, err_y, err_z]
+    names = ["East", "North", "Depth (towards Earth)"]
+    have_z = np.isfinite(res[2]).any()
+
+    fig = plt.figure(figsize=(13, 8.5))
+    grid = fig.add_gridspec(3 if have_z else 2, 2, width_ratios=[1.6, 1])
+    axes = [fig.add_subplot(grid[i, 0]) for i in range(3 if have_z else 2)]
+    ax_map = fig.add_subplot(grid[:2, 1])
+
+    unit = 1e3      # thousand km
+    for ax, r, e, name in zip(axes, res, errs, names):
+        ok = np.isfinite(r)
+        bar = _bars(e[ok]) if np.isfinite(e[ok]).any() else None
+        ax.axhline(0, color="tab:red", lw=1.2, label="Fitted orbit")
+        ax.errorbar(
+            t[ok], r[ok] / unit, yerr=None if bar is None else bar / unit,
+            fmt="o", ms=5, color="tab:blue", ecolor="0.2", elinewidth=1.2,
+            capsize=4, label="Measured minus fitted",
+        )
+        rms = float(np.sqrt(np.mean(r[ok] ** 2))) if ok.any() else np.nan
+        text = f"scatter (rms) {rms:,.0f} km"
+        if bar is not None:
+            text += f";  typical error bar ±{np.median(bar):,.0f} km"
+        elif name.startswith("Depth"):
+            text += ";  no measured error (ephemeris)"
+        ax.text(0.01, 0.95, text, transform=ax.transAxes, va="top", fontsize=8.5)
+        ax.set_ylabel(f"{name}\nresidual (10$^3$ km)")
+        ax.grid(True, alpha=0.3)
+        span = np.nanmax(np.abs(r[ok]) + (bar if bar is not None else 0)) / unit
+        ax.set_ylim(-1.25 * span, 1.25 * span)
+
+    axes[0].legend(fontsize=8, loc="upper right")
+    axes[-1].set_xlabel("Days since first image")
+
+    ok = np.isfinite(res[0]) & np.isfinite(res[1])
+    ax_map.axhline(0, color="0.7", lw=0.8)
+    ax_map.axvline(0, color="0.7", lw=0.8)
+    ax_map.errorbar(
+        res[0][ok] / unit, res[1][ok] / unit,
+        xerr=_bars(err_x[ok]) / unit if _bars(err_x[ok]) is not None else None,
+        yerr=_bars(err_y[ok]) / unit if _bars(err_y[ok]) is not None else None,
+        fmt="none", ecolor="0.2", elinewidth=1.1, capsize=3, zorder=2,
+    )
+    sc = ax_map.scatter(res[0][ok] / unit, res[1][ok] / unit, c=t[ok],
+                        cmap="viridis", s=36, zorder=3)
+    ax_map.plot(0, 0, "+", color="tab:red", ms=14, mew=1.6, zorder=4)
+    lim = 1.2 * np.nanmax(np.abs(np.concatenate([res[0][ok], res[1][ok]]))
+                          + np.nanmax(np.nan_to_num(np.concatenate([err_x[ok], err_y[ok]])))) / unit
+    ax_map.set_xlim(-lim, lim)
+    ax_map.set_ylim(-lim, lim)
+    ax_map.set_aspect("equal")
+    ax_map.grid(True, alpha=0.3)
+    ax_map.set_xlabel("East residual (10$^3$ km)")
+    ax_map.set_ylabel("North residual (10$^3$ km)")
+    ax_map.set_title("Where each point lies relative to the orbit\n(red cross = exactly on it)",
+                     fontsize=9)
+    fig.colorbar(sc, ax=ax_map, label="Days since first image", shrink=0.8)
+
+    fig.suptitle(
+        f"{moon.capitalize()} {year}: measured minus {model_name}, error bars at true size"
+        f"   (chi2_red = {fit['chi2_red']:.1f})",
+        fontsize=10,
+    )
+    fig.text(
+        0.99, 0.01,
+        "If the errors described the scatter, about two thirds of the bars would cross the red line.",
+        ha="right", va="bottom", fontsize=8, color="0.3",
+    )
+    fig.tight_layout(rect=(0, 0.02, 1, 0.95))
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
     """
     3D orbit diagram with the planet at the centre.
@@ -986,7 +1290,21 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
 
     scale = 1e6   # show megametres
 
+    errors = _errors_km(group, parent)
+    err_x, err_y, err_z = errors if errors is not None else (None, None, None)
+    bx, by, bz = _bars(err_x), _bars(err_y), _bars(err_z)
+    magnify = _magnification([err_x, err_y, err_z], radius)
+    bx, by, bz = [None if b is None else b * magnify for b in (bx, by, bz)]
+
     # ---- 3D ----
+    if bx is not None or by is not None or bz is not None:
+        ax3.errorbar(
+            obs_x / scale, obs_y / scale, obs_z / scale,
+            xerr=None if bx is None else bx / scale,
+            yerr=None if by is None else by / scale,
+            zerr=None if bz is None else bz / scale,
+            fmt="none", ecolor=ERRORBAR_COLOUR, elinewidth=0.9, capsize=2,
+        )
     ax3.scatter(
         obs_x / scale, obs_y / scale, obs_z / scale,
         c=obs_t, cmap="viridis", s=34, depthshade=False, label="Observed",
@@ -1017,7 +1335,16 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
     ax3.legend(fontsize=7, loc="upper left")
     ax3.set_title("3D orbit")
 
-    def panel(ax, xs, ys, cxs, cys, xlabel, ylabel, title, ecc_xy=None):
+    def panel(ax, xs, ys, cxs, cys, xlabel, ylabel, title, ecc_xy=None,
+              xerr=None, yerr=None):
+        if xerr is not None or yerr is not None:
+            ax.errorbar(
+                xs / scale, ys / scale,
+                xerr=None if xerr is None else xerr / scale,
+                yerr=None if yerr is None else yerr / scale,
+                fmt="none", ecolor=ERRORBAR_COLOUR, elinewidth=0.9,
+                capsize=2, zorder=2,
+            )
         ax.scatter(xs / scale, ys / scale, c=obs_t, cmap="viridis", s=34,
                    zorder=3)
         if cxs is not None:
@@ -1040,16 +1367,21 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
 
     panel(ax_sky, obs_x, obs_y, cxk, cyk,
           "East (10$^6$ km)", "North (10$^6$ km)", "View from Earth",
-          None if ec is None else (ec[0], ec[1]))
+          None if ec is None else (ec[0], ec[1]), xerr=bx, yerr=by)
     panel(ax_top, obs_x, obs_z, cxk, czk,
           "East (10$^6$ km)", "Towards Earth (10$^6$ km)",
           "East vs depth (closest to a top-down view)",
-          None if ec is None else (ec[0], ec[2]))
+          None if ec is None else (ec[0], ec[2]), xerr=bx, yerr=bz)
     panel(ax_side, obs_y, obs_z, cyk, czk,
           "North (10$^6$ km)", "Towards Earth (10$^6$ km)",
           "Side view (north vs depth)",
-          None if ec is None else (ec[1], ec[2]))
+          None if ec is None else (ec[1], ec[2]), xerr=by, yerr=bz)
     ax_top.invert_xaxis()
+
+    note = _error_note(err_x, err_y, err_z)
+    if note:
+        fig.text(0.5, 0.008, note + ".  " + _magnify_text(magnify),
+                 ha="center", va="bottom", fontsize=8, color="0.3")
 
     title = f"{moon.capitalize()} {year}: orbit around {parent.capitalize()}"
     if fit is not None:
@@ -1061,7 +1393,7 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
         title += "\napproximate scale: no dSat column, assumed distance used"
 
     fig.suptitle(title, fontsize=10)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.tight_layout(rect=(0, 0.025, 1, 0.95))
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
@@ -1207,8 +1539,45 @@ def plot_system_3d(groups, fits, parent, year, path):
             color="gold", alpha=0.9, linewidth=0,
         )
 
+    all_sky_errors = []
+    every_error = []
+    for moon in pieces:
+        errors = _errors_km(groups[moon], parent)
+        if errors is not None:
+            every_error += list(errors)
+    magnify = _magnification(every_error, radius)
+
     for colour, (moon, geom) in zip(colours, pieces.items()):
         obs_x, obs_y, obs_z, _, curve, _, ecc_c = geom
+
+        errors = _errors_km(groups[moon], parent)
+        err_x, err_y, err_z = errors if errors is not None else (None, None, None)
+        bx, by, bz = _bars(err_x), _bars(err_y), _bars(err_z)
+        bx, by, bz = [None if b is None else b * magnify for b in (bx, by, bz)]
+        for values in (err_x, err_y):
+            if values is not None and np.isfinite(values).any():
+                all_sky_errors.append(values[np.isfinite(values)])
+
+        if bx is not None or by is not None or bz is not None:
+            ax3.errorbar(
+                obs_x / scale, obs_y / scale, obs_z / scale,
+                xerr=None if bx is None else bx / scale,
+                yerr=None if by is None else by / scale,
+                zerr=None if bz is None else bz / scale,
+                fmt="none", ecolor=colour, elinewidth=0.8, capsize=1.5,
+            )
+            ax_sky.errorbar(
+                obs_x / scale, obs_y / scale,
+                xerr=None if bx is None else bx / scale,
+                yerr=None if by is None else by / scale,
+                fmt="none", ecolor=colour, elinewidth=0.8, capsize=1.5,
+            )
+            ax_top.errorbar(
+                obs_x / scale, obs_z / scale,
+                xerr=None if bx is None else bx / scale,
+                yerr=None if bz is None else bz / scale,
+                fmt="none", ecolor=colour, elinewidth=0.8, capsize=1.5,
+            )
 
         ax3.scatter(
             obs_x / scale, obs_y / scale, obs_z / scale,
@@ -1284,6 +1653,16 @@ def plot_system_3d(groups, fits, parent, year, path):
                     f"   eccentric fit: P = {ecc['period']:.3f} d, "
                     f"e = {ecc['e']:.3f}  (solid line; dashed = circular)"
                 )
+
+    if all_sky_errors:
+        typical = float(np.median(np.concatenate(all_sky_errors)))
+        lines.append("")
+        lines.append(f"Error bars: east/north typically ±{typical:,.0f} km")
+        lines.append("            " + _magnify_text(magnify))
+        lines.append(
+            f"            depth ±{float(DZ_ERROR_KM):,.0f} km" if DZ_ERROR_KM is not None
+            else "            depth from ephemeris (no measured error)"
+        )
 
     ax_note.text(0.0, 1.0, "\n".join(lines), va="top", fontsize=9,
                  family="monospace")
@@ -1428,7 +1807,7 @@ def make_orbit_animation(groups, fits, parent, year, path_stem):
     ax_sky.set_ylabel(f"North ({unit})")
     ax_sky.set_title("View from Earth")
 
-    ax_top.set_xlim(reach / scale, -reach / scale)      # east to the left
+    ax_top.set_xlim(-reach / scale, reach / scale)      # same east direction as the left panel
     ax_top.set_ylim(-reach / scale, reach / scale)
     ax_top.set_xlabel(f"East ({unit})")
     ax_top.set_ylabel(f"Towards Earth ({unit})")
@@ -1457,7 +1836,10 @@ def make_orbit_animation(groups, fits, parent, year, path_stem):
                                    mew=0.6, zorder=7, alpha=0.9)[0],
         }
 
-    ax_sky.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    fig.legend(
+        *ax_sky.get_legend_handles_labels(), loc="upper center",
+        bbox_to_anchor=(0.5, 0.945), ncol=len(tracks), fontsize=9, frameon=False,
+    )
     clock = fig.suptitle("", fontsize=12)
     fig.text(
         0.5, 0.015,
@@ -1465,7 +1847,7 @@ def make_orbit_animation(groups, fits, parent, year, path_stem):
         "night they were taken.  Lines: the last part of each path.",
         ha="center", fontsize=8, color="0.35",
     )
-    fig.tight_layout(rect=(0, 0.035, 1, 0.94))
+    fig.tight_layout(rect=(0, 0.035, 1, 0.90))
 
     def draw(frame):
         now = times[frame]
@@ -1533,8 +1915,11 @@ def plot_system_view(year_df, fits, parent, year, path):
 
     for colour, moon in zip(colours, moons):
         g = year_df.loc[year_df["moon"] == moon]
-        ax.plot(
-            g["sky_x_arcsec"], g["sky_y_arcsec"], "o", color=colour,
+        sx, sy = sky_errors(g)
+        ax.errorbar(
+            g["sky_x_arcsec"], g["sky_y_arcsec"],
+            xerr=_bars(sx), yerr=_bars(sy),
+            fmt="o", color=colour, ecolor=colour, elinewidth=0.9, capsize=2,
             ms=5, label=moon.capitalize(), zorder=4,
         )
 
@@ -1560,6 +1945,7 @@ PARENT_BODY_LOOKUP = {}
 
 FIT_COLUMNS = [
     "moon", "year", "parent", "n_images", "n_visits", "n_nights", "status",
+    "direction_check",
     "used_dz_in_fit", "a_arcsec", "a_err_arcsec", "a_km", "a_err_km",
     "b_arcsec", "b_over_a", "b_over_a_err",
     "tilt_deg", "psi_deg", "psi_err_deg",
@@ -1567,9 +1953,52 @@ FIT_COLUMNS = [
     "next_best_period_days", "next_best_delta_chi2",
     "phase_rad", "chi2_red",
     "ecc_e", "ecc_e_err", "ecc_period_days", "ecc_period_err_days",
-    "ecc_a_arcsec", "ecc_a_km", "ecc_a_err_km", "ecc_chi2_red", "ecc_delta_chi2",
+    "ecc_a_arcsec", "ecc_a_km", "ecc_a_err_km",
+    "ecc_psi_deg", "ecc_k", "ecc_m0_rad", "ecc_omega_rad", "ecc_z_sign",
+    "ecc_chi2_red", "ecc_delta_chi2",
     "ecc_p_value",
 ]
+
+
+def _direction_references(prepared, parent_body, year):
+    """
+    The orbital pole shared by most of each planet's moons (needs dz, so that
+    the pole is known in 3D). The pole is the average of the moons that agree
+    with each other; if two candidates tie, the one with the larger orbit
+    (longer period, so less prone to aliasing) wins.
+    """
+
+    references = {}
+    by_parent = {}
+
+    for moon, (_, _, fit) in prepared.items():
+        if fit is not None and fit["used_dz"]:
+            by_parent.setdefault(parent_body.get(moon, "planet"), []).append((moon, fit))
+
+    for parent, entries in by_parent.items():
+        if len(entries) < 2:
+            continue
+
+        tol = np.cos(np.radians(DIRECTION_TOLERANCE_DEG))
+        best = None
+
+        for moon_i, fit_i in entries:
+            group = [
+                (m, f) for m, f in entries
+                if float(np.dot(f["pole"], fit_i["pole"])) > tol
+            ]
+            rank = (len(group), fit_i["a"])
+
+            if best is None or rank > best[0]:
+                best = (rank, group)
+
+        group = best[1]
+        mean_pole = np.mean([f["pole"] for _, f in group], axis=0)
+        references[parent] = mean_pole / np.linalg.norm(mean_pole)
+        names = ", ".join(m for m, _ in group)
+        print(f"Direction check {parent} {year}: common orbital direction set by {names}.")
+
+    return references
 
 
 def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
@@ -1619,19 +2048,66 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
         groups = {}
         year_records = []
 
+        # First pass: fit every moon on its own.
+        prepared = {}
+
         for moon, group in year_df.groupby("moon"):
             group = group.sort_values("datetime").copy()
-
             origin = group["datetime"].min()
             group["t"] = (
                 (group["datetime"] - origin).dt.total_seconds() / 86400.0
             )
+            visits = combine_visits(group)
+            prepared[moon] = (group, visits, fit_orbit(visits))
 
+        # Second pass: all moons of one planet must orbit the same way.
+        direction_notes = {moon: "not checked" for moon in prepared}
+
+        if CHECK_DIRECTION:
+            references = _direction_references(prepared, parent_body, year)
+
+            for moon, (group, visits, fit) in list(prepared.items()):
+                if fit is None:
+                    continue
+
+                parent = parent_body.get(moon, "planet")
+                reference = references.get(parent)
+                verdict = _direction_agrees(fit["pole"], fit["used_dz"], reference)
+
+                if verdict is True:
+                    direction_notes[moon] = "agrees with the other moons"
+                elif verdict is False:
+                    old_period = fit["period"]
+                    corrected = fit_orbit(visits, required_pole=reference)
+
+                    if corrected is not None:
+                        prepared[moon] = (group, visits, corrected)
+                        direction_notes[moon] = (
+                            f"opposite direction at P = {old_period:.3f} d; "
+                            "refitted with the common direction"
+                        )
+                        print(
+                            f"Direction check: {moon} {year} ran the opposite way to the "
+                            f"other moons at P = {old_period:.3f} d (probably an alias). "
+                            f"Refitted with the common direction: P = {corrected['period']:.4f} d "
+                            f"({corrected['period_status']}, chi2_red {fit['chi2_red']:.1f} -> "
+                            f"{corrected['chi2_red']:.1f})."
+                        )
+                    else:
+                        fit["period_status"] = (
+                            "ambiguous (runs opposite to the other moons: probable alias)"
+                        )
+                        direction_notes[moon] = "opposite direction, could not be corrected"
+                        print(
+                            f"Direction check: {moon} {year} runs the opposite way to the "
+                            f"other moons and no period with the right direction fits; "
+                            "marked ambiguous."
+                        )
+
+        for moon, (group, visits, fit) in prepared.items():
+            origin = group["datetime"].min()
             n_nights = int(group["datetime"].dt.normalize().nunique())
             parent = parent_body.get(moon, "planet")
-
-            visits = combine_visits(group)
-            fit = fit_orbit(visits)
 
             if fit is not None and moon in ECCENTRIC_MOONS:
                 fit["ecc"] = fit_eccentric(visits, fit)
@@ -1643,6 +2119,7 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                 "moon": moon, "year": year, "parent": parent,
                 "n_images": len(group), "n_visits": len(visits),
                 "n_nights": n_nights,
+                "direction_check": direction_notes.get(moon, "not checked"),
             }
 
             if fit is None:
@@ -1714,6 +2191,12 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                         "ecc_a_arcsec": ecc["a"],
                         "ecc_a_km": ecc["a"] * km_per_arcsec,
                         "ecc_a_err_km": ecc["a_err"] * km_per_arcsec,
+                        # full orbit, so other scripts can redraw the curve
+                        "ecc_psi_deg": float(np.degrees(ecc["psi"])),
+                        "ecc_k": ecc["k"],
+                        "ecc_m0_rad": ecc["m0"],
+                        "ecc_omega_rad": ecc["omega"],
+                        "ecc_z_sign": ecc["sign"],
                         "ecc_chi2_red": ecc["chi2_red"],
                         "ecc_delta_chi2": ecc["delta_chi2"],
                         "ecc_p_value": ecc["p_value"],
@@ -1751,6 +2234,12 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                 plot_orbit_3d(
                     group, fit, moon, year, parent, origin,
                     year_dir / f"{moon}_orbit3d.png",
+                )
+
+            if MAKE_RESIDUAL_PLOTS and fit is not None:
+                plot_residuals(
+                    group, fit, moon, year, parent,
+                    year_dir / f"{moon}_residuals.png",
                 )
 
         for parent in sorted(set(parent_body.get(m) for m in fits)):
