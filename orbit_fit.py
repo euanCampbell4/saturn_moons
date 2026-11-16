@@ -584,6 +584,12 @@ def fit_orbit(vis, required_pole=None):
     if not weighted:
         # No usable centroid errors: scale by the scatter of the fit.
         cov = cov * chi2_red
+    else:
+        # The centroid errors are trusted as a minimum. If the points scatter
+        # about the orbit by more than those errors (chi2_red > 1), the
+        # parameter errors are enlarged to match the real scatter; they are
+        # never made smaller than the centroid errors imply.
+        cov = cov * max(chi2_red, 1.0)
 
     err = np.sqrt(np.maximum(np.diag(cov), 0.0))
 
