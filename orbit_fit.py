@@ -120,28 +120,6 @@ MAKE_3D_PLOTS = True
 DZ_ERROR_KM = None
 ERRORBAR_COLOUR = "0.25"
 
-# Systematic error floor scaled by the seeing.
-# A Gaussian centroid error only says how well a peak is located in one
-# profile. The real scatter is larger (the planet's centre under rings and
-# glare, offsets read to whole pixels) and grows when the seeing is worse.
-# So each image gets an extra error
-#     floor = ERROR_FLOOR_FWHM_FRACTION x FWHM      (arcsec)
-# added in quadrature to its east and north errors. FWHM comes from the
-# fwhm_arcsec column, which the pipeline fills from your FWHM column (or,
-# where that is empty, from the moon's own Gaussian fit).
-#   "auto"  one fraction per planet (Saturn's glare and rings are not
-#           Neptune's), chosen so that the combined reduced chi-squared of
-#           that planet's well-determined fits, on the sky positions, is 1;
-#   0.3     (any number) use that fraction;
-#   0/None  no floor: centroid errors only.
-ERROR_FLOOR_FWHM_FRACTION = "auto"
-# What "auto" aims for:
-#   "median"  the typical fit has reduced chi-squared 1, so one badly fitting
-#             moon (e.g. Enceladus in Saturn's glare) does not inflate the
-#             errors of all the others;
-#   "pooled"  all fits combined have reduced chi-squared 1.
-ERROR_FLOOR_TARGET = "median"
-
 # The errors are thousands of km on orbits a million km across, so at true
 # size the bars hide behind the points. Two ways to make them visible:
 #  1. Magnify the bars on the orbit plots. "auto" picks a round factor so a
@@ -149,7 +127,7 @@ ERROR_FLOOR_TARGET = "median"
 #     1 draws them at true size. The factor is always written on the plot.
 #  2. A separate residual plot per moon (measured minus fitted position),
 #     where the bars are drawn at TRUE size on a zoomed-in scale.
-ERRORBAR_MAGNIFY = "auto"
+ERRORBAR_MAGNIFY = "1"
 MAKE_RESIDUAL_PLOTS = True
 
 # Direction check. All of a planet's regular moons orbit the same way (the
@@ -277,12 +255,6 @@ def sky_errors(df):
 
     sx = np.hypot(cd[:, 0] * sdx, cd[:, 1] * sdy)
     sy = np.hypot(cd[:, 2] * sdx, cd[:, 3] * sdy)
-
-    # Seeing-scaled systematic floor (see ERROR_FLOOR_FWHM_FRACTION).
-    if "floor_arcsec" in df.columns:
-        floor = np.nan_to_num(df["floor_arcsec"].to_numpy(dtype=float), nan=0.0)
-        sx = np.where(np.isfinite(sx), np.hypot(sx, floor), np.where(floor > 0, floor, np.nan))
-        sy = np.where(np.isfinite(sy), np.hypot(sy, floor), np.where(floor > 0, floor, np.nan))
 
     return sx, sy
 
@@ -2019,7 +1991,6 @@ PARENT_BODY_LOOKUP = {}
 FIT_COLUMNS = [
     "moon", "year", "parent", "n_images", "n_visits", "n_nights", "status",
     "direction_check",
-    "error_floor_fwhm_fraction", "median_fwhm_arcsec", "median_floor_arcsec", "median_floor_km",
     "used_dz_in_fit", "depth_sign_from_dz", "a_arcsec", "a_err_arcsec", "a_km", "a_err_km",
     "b_arcsec", "b_over_a", "b_over_a_err",
     "tilt_deg", "psi_deg", "psi_err_deg",
@@ -2032,187 +2003,6 @@ FIT_COLUMNS = [
     "ecc_chi2_red", "ecc_delta_chi2",
     "ecc_p_value",
 ]
-
-
-def _seeing_arcsec(df):
-    """FWHM in arcsec per row; gaps filled with the median. None if no FWHM."""
-
-    if "fwhm_arcsec" not in df.columns:
-        return None
-
-    fwhm = df["fwhm_arcsec"].to_numpy(dtype=float, copy=True)
-    finite = fwhm[np.isfinite(fwhm) & (fwhm > 0)]
-
-    if not len(finite):
-        return None
-
-    fwhm[~(np.isfinite(fwhm) & (fwhm > 0))] = float(np.median(finite))
-    return fwhm
-
-
-def _moon_year_groups(df):
-    """(year, moon, group) with each group's time column, as the main fit uses."""
-
-    out = []
-
-    for (year, moon), group in df.groupby(["year", "moon"]):
-        group = group.sort_values("datetime").copy()
-        group["t"] = (group["datetime"] - group["datetime"].min()).dt.total_seconds() / 86400.0
-        out.append((year, moon, group))
-
-    return out
-
-
-def _calibration_fits(df, fraction, fwhm):
-    """Fit every moon-year with the floor at `fraction`; keep the trustworthy fits."""
-
-    work = df.copy()
-    work["floor_arcsec"] = fraction * fwhm
-    work["sigma_sky_x"], work["sigma_sky_y"] = sky_errors(work)
-    kept = []
-
-    for year, moon, group in _moon_year_groups(work):
-        visits = combine_visits(group)
-        fit = fit_orbit(visits)
-
-        if fit is None or not fit["weighted"] or fit["period_status"] != "unique":
-            continue
-
-        ecc = fit_eccentric(visits, fit) if moon in ECCENTRIC_MOONS else None
-        kept.append((group.index, fit, ecc))
-
-    return kept
-
-
-def _pooled_chi2_red(df, kept, fraction, fwhm):
-    """
-    Combined reduced chi-squared of fixed orbits at a given floor, from the
-    east and north positions only. The depth values come from an ephemeris
-    and carry no measured error, so they take no part in setting the floor.
-    Degrees of freedom: 2 per visit, less the orbit's parameters.
-    """
-
-    work = df.copy()
-    work["floor_arcsec"] = fraction * fwhm
-    work["sigma_sky_x"], work["sigma_sky_y"] = sky_errors(work)
-    chi2_total, dof_total = 0.0, 0
-    per_fit = []
-
-    for index, fit, ecc in kept:
-        group = work.loc[index].sort_values("datetime").copy()
-        group["t"] = (group["datetime"] - group["datetime"].min()).dt.total_seconds() / 86400.0
-        vis = combine_visits(group)
-        t = vis["t"].to_numpy(dtype=float)
-
-        if ecc is not None:
-            mx, my, mz = ecc_xyz(ecc, t)
-            n_par = 7
-        else:
-            mx, my = model_from_fit(fit, t)
-            mz = depth_model(t, fit["a"], fit["k"], fit["period"], fit["phase"], fit["z_sign"])
-            n_par = 5
-
-        sxi = vis["sxi"].to_numpy(dtype=float)
-        seta = vis["seta"].to_numpy(dtype=float)
-        chi2 = np.sum(((vis["xi"].to_numpy(dtype=float) - mx) / sxi) ** 2)
-        chi2 += np.sum(((vis["eta"].to_numpy(dtype=float) - my) / seta) ** 2)
-
-        chi2_total += float(chi2)
-        dof_total += 2 * len(vis) - n_par
-        per_fit.append(float(chi2) / max(2 * len(vis) - n_par, 1))
-
-    if ERROR_FLOOR_TARGET == "median" and per_fit:
-        return float(np.median(per_fit))
-
-    return chi2_total / dof_total if dof_total > 0 else np.nan
-
-
-def _solve_fraction(df, kept, fwhm):
-    """Smallest fraction that brings the combined reduced chi-squared to 1."""
-
-    if not kept or _pooled_chi2_red(df, kept, 0.0, fwhm) <= 1.0:
-        return 0.0
-
-    hi = 0.05
-    while _pooled_chi2_red(df, kept, hi, fwhm) > 1.0 and hi < 20:
-        hi *= 2
-
-    lo = 0.0
-    for _ in range(40):
-        mid = 0.5 * (lo + hi)
-        if _pooled_chi2_red(df, kept, mid, fwhm) > 1.0:
-            lo = mid
-        else:
-            hi = mid
-
-    return hi
-
-
-def apply_error_floor(df, parent_body=None):
-    """
-    Add the seeing-scaled floor (column floor_arcsec) to every row.
-
-    With "auto" the fraction is found for each planet in two rounds: fit with
-    no floor, find the fraction that makes those orbits' combined reduced
-    chi-squared 1, refit with that floor, and find the fraction again. Only
-    fits with a unique period and real centroid errors take part, so an
-    aliased fit cannot inflate the floor. Returns (df, {planet: fraction}).
-    """
-
-    setting = ERROR_FLOOR_FWHM_FRACTION
-    fwhm = _seeing_arcsec(df)
-    df = df.copy()
-    df["floor_arcsec"] = 0.0
-    parent_body = parent_body or {}
-    planets = df["moon"].map(lambda m: parent_body.get(m, "planet"))
-
-    if setting in (None, 0, 0.0, False):
-        print("Error floor: off (centroid errors only).")
-        return df, {}
-
-    if fwhm is None:
-        print("Error floor: no FWHM in the data (add an FWHM column to "
-              "relative_positions.csv), so centroid errors only.")
-        return df, {}
-
-    if setting != "auto":
-        fraction = float(setting)
-        df["floor_arcsec"] = fraction * fwhm
-        print(f"Error floor: {fraction:.3f} x FWHM (set by hand), median "
-              f"{np.median(fraction * fwhm):.2f}\".")
-        return df, {planet: fraction for planet in planets.unique()}
-
-    fractions = {}
-
-    for planet in sorted(planets.unique()):
-        rows = (planets == planet).to_numpy()
-        sub = df.loc[rows].copy()
-        seeing = fwhm[rows]
-
-        kept = _calibration_fits(sub, 0.0, seeing)
-        if not kept:
-            print(f"Error floor {planet}: no well-determined fit to calibrate on; "
-                  "centroid errors only.")
-            fractions[planet] = 0.0
-            continue
-
-        before = _pooled_chi2_red(sub, kept, 0.0, seeing)
-        fraction = _solve_fraction(sub, kept, seeing)
-        kept = _calibration_fits(sub, fraction, seeing)        # refit with the floor
-        if kept:
-            fraction = _solve_fraction(sub, kept, seeing)
-        after = _pooled_chi2_red(sub, kept, fraction, seeing) if kept else np.nan
-
-        df.loc[rows, "floor_arcsec"] = fraction * seeing
-        fractions[planet] = fraction
-        floor = fraction * seeing
-        print(
-            f"Error floor {planet} (auto): {fraction:.3f} x FWHM = median {np.median(floor):.2f}\" "
-            f"(range {np.min(floor):.2f}-{np.max(floor):.2f}\"). {ERROR_FLOOR_TARGET.capitalize()} reduced "
-            f"chi-squared of the sky positions {before:.1f} without it, {after:.2f} with it ({len(kept)} fit(s))."
-        )
-
-    return df, fractions
 
 
 def _direction_references(prepared, parent_body, year):
@@ -2283,9 +2073,8 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
     df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
     df = df.dropna(subset=["datetime", "sky_x_arcsec", "sky_y_arcsec"])
     df["year"] = df["datetime"].dt.year
-    df = ensure_distance_columns(df)
-    df, floor_fractions = apply_error_floor(df, parent_body)
     df["sigma_sky_x"], df["sigma_sky_y"] = sky_errors(df)
+    df = ensure_distance_columns(df)
 
     if MAKE_3D_PLOTS and "dz_km" not in df.columns:
         print(
@@ -2376,16 +2165,6 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                 "n_images": len(group), "n_visits": len(visits),
                 "n_nights": n_nights,
                 "direction_check": direction_notes.get(moon, "not checked"),
-                "error_floor_fwhm_fraction": floor_fractions.get(parent, 0.0),
-                "median_fwhm_arcsec": (
-                    float(np.nanmedian(group["fwhm_arcsec"]))
-                    if "fwhm_arcsec" in group and np.isfinite(group["fwhm_arcsec"]).any()
-                    else np.nan
-                ),
-                "median_floor_arcsec": float(np.nanmedian(group["floor_arcsec"])),
-                "median_floor_km": float(
-                    np.nanmedian(group["floor_arcsec"] * group["dsat_km"] / ARCSEC_PER_RAD)
-                ) if "dsat_km" in group and np.isfinite(group["dsat_km"]).any() else np.nan,
             }
 
             if fit is None:

@@ -86,6 +86,12 @@ ANGULAR_PLOT_DIR = OUT_DIR / "angular_plots"
 SLOPED_BACKGROUND = False
 START_PIXEL = 0
 
+# Measurement error on each centre (moon and planet), in pixels, from placing
+# the centre by hand. dX and dY each get the moon's and the planet's in
+# quadrature: sqrt(0.5^2 + 0.5^2) = 0.71 px, added in quadrature to the
+# Gaussian centroid errors. Set to 0 to use the Gaussian errors only.
+MEASUREMENT_ERROR_PX = 0.5
+
 # Extend this dictionary if more satellites are added.
 PARENT_BODY = {
     "titan": "saturn",
@@ -144,12 +150,6 @@ N_BOOTSTRAP = 300                 # resamples used for the ellipse-axis errors
 #           arcseconds into km.
 # Units of both: "auto" treats values whose median magnitude is below 10 as AU
 # and larger values as km.
-# Seeing (FWHM) for each observation, used by orbit_fit.py to set a
-# systematic error floor. Put it in relative_positions.csv as a column whose
-# name starts with "FWHM" (or "Seeing"). Say which unit it is in:
-FWHM_UNIT = "arcsec"                   # "px" (pixels) or "arcsec"
-# Rows with no FWHM value use the moon's own Gaussian-fit FWHM instead.
-
 DIST_UNIT = "auto"                # "auto", "au" or "km"
 
 # Used for the km conversion and the dz fit when the CSV has no dsat column.
@@ -423,16 +423,6 @@ def load_relative_positions():
     for column in numeric_columns:
         df[column] = pd.to_numeric(df[column], errors="raise")
 
-    # Optional seeing column (see FWHM_UNIT).
-    fwhm_columns = [
-        c for c in df.columns
-        if c.replace(" ", "").startswith(("fwhm", "seeing"))
-    ]
-    df["fwhm_input"] = (
-        pd.to_numeric(df[fwhm_columns[0]], errors="coerce")
-        if fwhm_columns else np.nan
-    )
-
     # Optional distance columns (see DIST_UNIT).
     def to_km(prefix):
         # Accepts headers such as "dz", "dZ (km)", "dsat", "dSaturn", "dPlanet".
@@ -677,6 +667,23 @@ def calculate_angular_separations(centres):
             df.loc[missing, column] = float(finite.median())
             df.loc[missing, "error_filled"] = True
 
+    # Measurement error on the moon's and the planet's centres (see
+    # MEASUREMENT_ERROR_PX), in quadrature with the Gaussian errors:
+    #   sigma_dX^2 = sigma_moon^2 + sigma_planet^2 + m^2 + m^2
+    df["sigma_dx_gauss"] = df["sigma_dx"]
+    df["sigma_dy_gauss"] = df["sigma_dy"]
+
+    if MEASUREMENT_ERROR_PX:
+        measurement = np.sqrt(2.0) * float(MEASUREMENT_ERROR_PX)
+        for column in ("sigma_dx", "sigma_dy"):
+            base = df[column].to_numpy(dtype=float)
+            df[column] = np.where(np.isfinite(base), np.hypot(base, measurement), measurement)
+        print(
+            f"Measurement error: +/-{MEASUREMENT_ERROR_PX:g} px on each centre, so "
+            f"+/-{measurement:.3f} px on dX and dY, added in quadrature to the Gaussian errors "
+            f"(median total {np.nanmedian(df['sigma_dx']):.3f} px in X, {np.nanmedian(df['sigma_dy']):.3f} px in Y)."
+        )
+
     dx = df["dx"].to_numpy(dtype=float)
     dy = df["dy"].to_numpy(dtype=float)
 
@@ -692,45 +699,6 @@ def calculate_angular_separations(centres):
     sky_y = cd[:, 2] * dx + cd[:, 3] * dy
 
     separation = np.hypot(sky_x, sky_y)
-
-    # Seeing (FWHM) in arcsec for each observation: your FWHM column first,
-    # otherwise the moon's own Gaussian-fit FWHM (mean of its x and y fits).
-    pixel_scale = np.sqrt(np.abs(cd[:, 0] * cd[:, 3] - cd[:, 1] * cd[:, 2]))
-    df["pixel_scale_arcsec"] = pixel_scale
-
-    fitted = centres.copy()
-    fitted["date"] = pd.to_datetime(fitted["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    fitted["moon"] = fitted["moon"].str.lower().str.strip()
-    fitted["image"] = fitted["image"].str.lower().str.strip()
-    fitted = (
-        fitted.groupby(["date", "image", "moon"], as_index=False)["fwhm_px"].mean()
-        .rename(columns={"fwhm_px": "fwhm_fit_px"})
-    )
-    df = df.merge(fitted, on=["date", "image", "moon"], how="left")
-
-    given = df["fwhm_input"].to_numpy(dtype=float)
-    given_arcsec = given if FWHM_UNIT == "arcsec" else given * pixel_scale
-    from_fit = df["fwhm_fit_px"].to_numpy(dtype=float) * pixel_scale
-    df["fwhm_arcsec"] = np.where(np.isfinite(given_arcsec), given_arcsec, from_fit)
-    df["fwhm_source"] = np.where(
-        np.isfinite(given_arcsec), "your column",
-        np.where(np.isfinite(from_fit), "moon Gaussian fit", "none"),
-    )
-
-    good = np.isfinite(df["fwhm_arcsec"])
-    if good.any():
-        fw = df.loc[good, "fwhm_arcsec"]
-        counts = df["fwhm_source"].value_counts().to_dict()
-        print(
-            f"Seeing (FWHM): median {fw.median():.2f}\" "
-            f"(range {fw.min():.2f}-{fw.max():.2f}\"), "
-            f"median {np.nanmedian(df.loc[good, 'fwhm_arcsec'] / df.loc[good, 'pixel_scale_arcsec']):.2f} px. "
-            "Source: " + ", ".join(f"{k} {v}" for k, v in counts.items())
-        )
-        if FWHM_UNIT == "px" and fw.median() > 15:
-            print("   Check FWHM_UNIT: these look too large for pixels' worth of seeing.")
-    else:
-        print("No FWHM available, so no seeing-based error floor can be used.")
 
     df["sky_x_arcsec"] = sky_x
     df["sky_y_arcsec"] = sky_y
