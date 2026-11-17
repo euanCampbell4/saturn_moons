@@ -37,10 +37,12 @@ Images taken close together in time (VISIT_GAP_MINUTES) are averaged into one
 dz (optional columns dz_km and dsat_km)
 ---------------------------------------
 dz = (distance Earth-planet) - (distance Earth-moon) from an ephemeris, so it
-already contains the known orbit. With USE_DZ_IN_FIT = True the period is
-fitted from the sky positions AND dz, and is therefore partly informed by the
-ephemeris. Set USE_DZ_IN_FIT = False for a result from the sky positions
-alone (dz is then only reported as a consistency check).
+already contains the known orbit and has no measured error. By default
+(USE_DZ_IN_FIT = False) the orbits are fitted from the sky positions alone,
+and dz is used only where no error is needed: to choose which half of each
+orbit is nearer Earth (a yes/no choice), for the direction check, and for the
+3D plots. USE_DZ_IN_FIT = True adds dz to the chi-squared, which needs an
+assumed error for it.
 
 Each observing year is fitted on its own. Nothing is combined across years.
 
@@ -94,8 +96,11 @@ SCAN_OVERSAMPLE = 400        # fine, because well-measured data has narrow dips
 N_CANDIDATES = 6             # best periods refined with the full model
 ALIAS_DELTA_CHI2 = 9.0       # alternatives within this (in noise units) are "not ruled out"
 
-# Use dz as a third coordinate in the fit (see the module docstring).
-USE_DZ_IN_FIT = True
+# Use dz as a third coordinate in the chi-squared (see the module docstring).
+# False: fit the sky positions only; dz just picks which half of the orbit is
+# nearer Earth. True: dz enters the fit with an ASSUMED error equal to one sky
+# coordinate's, because the ephemeris gives none.
+USE_DZ_IN_FIT = False
 
 # Also fit a constant offset (x0, y0) of the planet centre. Leave False
 # unless you suspect the planet centroid is biased (rings, saturation).
@@ -462,6 +467,24 @@ def _direction_agrees(pole, used_dz, reference):
     return bool(np.sign(pole[2]) == np.sign(reference[2]))
 
 
+def _dz_sign(t, z, a, k, period, phase):
+    """
+    Which half of the orbit is nearer Earth, from dz: +1 or -1, or None if
+    there is no dz. This is a yes/no choice (the sign that agrees with the
+    ephemeris depths), so it needs no error for dz.
+    """
+
+    ok = np.isfinite(z)
+
+    if not ok.any():
+        return None
+
+    model = depth_model(t[ok], a, k, period, phase, 1.0)
+    agreement = float(np.sum(z[ok] * model))
+
+    return 1.0 if agreement >= 0 else -1.0
+
+
 def fit_orbit(vis, required_pole=None):
     """
     Weighted least-squares fit of the projected ellipse to the visits.
@@ -586,8 +609,9 @@ def fit_orbit(vis, required_pole=None):
 
                 if required_pole is not None:
                     x = result.x
-                    pole = _pole_vector(x[0], x[1], x[2], x[3], x[4], sign)
-                    if _direction_agrees(pole, use_z, required_pole) is False:
+                    depth_sign = sign if use_z else _dz_sign(t, z, x[0], x[1], x[3], x[4])
+                    pole = _pole_vector(x[0], x[1], x[2], x[3], x[4], depth_sign or 1.0)
+                    if _direction_agrees(pole, depth_sign is not None, required_pole) is False:
                         continue
 
                 if best_here is None or result.cost < best_here[0].cost:
@@ -653,6 +677,13 @@ def fit_orbit(vis, required_pole=None):
     else:
         period_status = "unique"
 
+    # Sky-only fit: dz decides which half of the orbit is nearer Earth.
+    sign_from_dz = False
+    if not use_z:
+        dz_sign = _dz_sign(t, z, p[0], p[1], p[3], p[4])
+        if dz_sign is not None:
+            sign, sign_from_dz = dz_sign, True
+
     psi_w, phase_w = _wrap(p[2], p[4])
 
     # _wrap shifts the phase by m*pi, which flips cos(theta) when m is odd,
@@ -671,6 +702,8 @@ def fit_orbit(vis, required_pole=None):
         "chi2_red": chi2_red,
         "weighted": weighted,
         "used_dz": use_z,
+        "depth_sign_from_dz": sign_from_dz,
+        "has_3d": bool(use_z or sign_from_dz),
         "z_sign": sign_wrapped,
         "psi_raw": p[2], "phase_raw": p[4], "z_sign_raw": sign,
         "chi2": chi2, "dof": dof,
@@ -797,6 +830,12 @@ def fit_eccentric(vis, circ):
     p = result.x
     chi2 = float(np.sum(result.fun ** 2))
     chi2_red = chi2 / dof
+
+    # Sky-only fit: dz decides which half of the orbit is nearer Earth.
+    if not use_z and np.isfinite(z).any():
+        ok = np.isfinite(z)
+        mz = ecc_model(t, *p, 1.0)[2]
+        sign = 1.0 if float(np.sum(z[ok] * mz[ok])) >= 0 else -1.0
 
     cov = np.linalg.pinv(result.jac.T @ result.jac)
     # Conservative: if the model does not fit within the stated errors,
@@ -1279,8 +1318,8 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
         cx, cy = model_from_fit(fit, tt)
 
         # Direction of travel along the line of sight is fixed by the fit
-        # when dz was used; otherwise choose the sign that matches dz.
-        if fit["used_dz"]:
+        # (from dz); otherwise choose the sign that matches dz.
+        if fit.get("has_3d"):
             sign = fit["z_sign"]
         else:
             z_obs_arc = obs_z / km
@@ -1981,7 +2020,7 @@ FIT_COLUMNS = [
     "moon", "year", "parent", "n_images", "n_visits", "n_nights", "status",
     "direction_check",
     "error_floor_fwhm_fraction", "median_fwhm_arcsec", "median_floor_arcsec", "median_floor_km",
-    "used_dz_in_fit", "a_arcsec", "a_err_arcsec", "a_km", "a_err_km",
+    "used_dz_in_fit", "depth_sign_from_dz", "a_arcsec", "a_err_arcsec", "a_km", "a_err_km",
     "b_arcsec", "b_over_a", "b_over_a_err",
     "tilt_deg", "psi_deg", "psi_err_deg",
     "period_days", "period_err_days", "period_status",
@@ -2188,7 +2227,7 @@ def _direction_references(prepared, parent_body, year):
     by_parent = {}
 
     for moon, (_, _, fit) in prepared.items():
-        if fit is not None and fit["used_dz"]:
+        if fit is not None and fit.get("has_3d"):
             by_parent.setdefault(parent_body.get(moon, "planet"), []).append((moon, fit))
 
     for parent, entries in by_parent.items():
@@ -2289,7 +2328,7 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
 
                 parent = parent_body.get(moon, "planet")
                 reference = references.get(parent)
-                verdict = _direction_agrees(fit["pole"], fit["used_dz"], reference)
+                verdict = _direction_agrees(fit["pole"], fit.get("has_3d", False), reference)
 
                 if verdict is True:
                     direction_notes[moon] = "agrees with the other moons"
@@ -2388,6 +2427,7 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                 record.update({
                     "status": status,
                     "used_dz_in_fit": fit["used_dz"],
+                    "depth_sign_from_dz": fit.get("depth_sign_from_dz", False),
                     "a_arcsec": fit["a"],
                     "a_err_arcsec": fit["a_err"],
                     "a_km": fit["a"] * km_per_arcsec,

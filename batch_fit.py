@@ -147,7 +147,7 @@ N_BOOTSTRAP = 300                 # resamples used for the ellipse-axis errors
 # Seeing (FWHM) for each observation, used by orbit_fit.py to set a
 # systematic error floor. Put it in relative_positions.csv as a column whose
 # name starts with "FWHM" (or "Seeing"). Say which unit it is in:
-FWHM_UNIT = "px"                   # "px" (pixels) or "arcsec"
+FWHM_UNIT = "arcsec"                   # "px" (pixels) or "arcsec"
 # Rows with no FWHM value use the moon's own Gaussian-fit FWHM instead.
 
 DIST_UNIT = "auto"                # "auto", "au" or "km"
