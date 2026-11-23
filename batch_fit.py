@@ -90,7 +90,9 @@ START_PIXEL = 0
 # the centre by hand. dX and dY each get the moon's and the planet's in
 # quadrature: sqrt(0.5^2 + 0.5^2) = 0.71 px, added in quadrature to the
 # Gaussian centroid errors. Set to 0 to use the Gaussian errors only.
-MEASUREMENT_ERROR_PX = 0.5
+
+MOON_CENTRE_ERROR_PX = 0.5                                  # each moon's centre
+PLANET_CENTRE_ERROR_PX = {"saturn": 1.0, "neptune": 0.5}   # each planet's centre
 
 # Extend this dictionary if more satellites are added.
 PARENT_BODY = {
@@ -673,16 +675,14 @@ def calculate_angular_separations(centres):
     df["sigma_dx_gauss"] = df["sigma_dx"]
     df["sigma_dy_gauss"] = df["sigma_dy"]
 
-    if MEASUREMENT_ERROR_PX:
-        measurement = np.sqrt(2.0) * float(MEASUREMENT_ERROR_PX)
-        for column in ("sigma_dx", "sigma_dy"):
-            base = df[column].to_numpy(dtype=float)
-            df[column] = np.where(np.isfinite(base), np.hypot(base, measurement), measurement)
-        print(
-            f"Measurement error: +/-{MEASUREMENT_ERROR_PX:g} px on each centre, so "
-            f"+/-{measurement:.3f} px on dX and dY, added in quadrature to the Gaussian errors "
-            f"(median total {np.nanmedian(df['sigma_dx']):.3f} px in X, {np.nanmedian(df['sigma_dy']):.3f} px in Y)."
-        )
+    planet_err = df["parent"].map(PLANET_CENTRE_ERROR_PX).fillna(MOON_CENTRE_ERROR_PX)
+    measurement = np.hypot(MOON_CENTRE_ERROR_PX, planet_err.to_numpy(dtype=float))
+    for column in ("sigma_dx", "sigma_dy"):
+        base = df[column].to_numpy(dtype=float)
+        df[column] = np.where(np.isfinite(base), np.hypot(base, measurement), measurement)
+    for planet, err in PLANET_CENTRE_ERROR_PX.items():
+        print(f"Measurement error: moon +/-{MOON_CENTRE_ERROR_PX:g} px, {planet} +/-{err:g} px "
+              f"-> +/-{np.hypot(MOON_CENTRE_ERROR_PX, err):.3f} px on dX and dY")
 
     dx = df["dx"].to_numpy(dtype=float)
     dy = df["dy"].to_numpy(dtype=float)
