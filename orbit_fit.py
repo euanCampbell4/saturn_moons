@@ -120,14 +120,9 @@ MAKE_3D_PLOTS = True
 DZ_ERROR_KM = None
 ERRORBAR_COLOUR = "0.25"
 
-# The errors are thousands of km on orbits a million km across, so at true
-# size the bars hide behind the points. Two ways to make them visible:
-#  1. Magnify the bars on the orbit plots. "auto" picks a round factor so a
-#     typical bar is about 4% of the plot width; a number sets it yourself;
-#     1 draws them at true size. The factor is always written on the plot.
-#  2. A separate residual plot per moon (measured minus fitted position),
-#     where the bars are drawn at TRUE size on a zoomed-in scale.
-ERRORBAR_MAGNIFY = "1"
+# Every error bar is drawn at its TRUE size. On the full orbit plots they are
+# often smaller than the points; the residual plot per moon (measured minus
+# fitted position, zoomed in) shows them clearly, still at true size.
 MAKE_RESIDUAL_PLOTS = True
 
 # Direction check. All of a planet's regular moons orbit the same way (the
@@ -855,9 +850,40 @@ def model_from_fit(fit, t):
 # PLOTS
 # ============================================================
 
-def _sky_axes_labels(ax):
-    ax.set_xlabel("RA offset (arcsec)   East ←")
-    ax.set_ylabel("Dec offset (arcsec)   → North")
+def _km_scales(group, parent):
+    """
+    km per arcsec for every image (from that night's planet distance) and
+    km per arcsec at the reference distance the fit used (the mean distance).
+    The fit works in "arcsec at the reference distance", so the model is
+    converted with km_ref and each measured point with its own night's value.
+    Returns (km_each, km_ref), or (None, None) if no distance is known.
+    """
+
+    dsat = (
+        group["dsat_km"].to_numpy(dtype=float)
+        if "dsat_km" in group else np.full(len(group), np.nan)
+    )
+    finite = dsat[np.isfinite(dsat)]
+
+    if len(finite):
+        d_ref = float(finite.mean())
+    else:
+        au = FALLBACK_PLANET_DISTANCE_AU.get(parent)
+        if au is None:
+            return None, None
+        d_ref = au * 1.495978707e8
+
+    km_each = np.where(np.isfinite(dsat), dsat, d_ref) / ARCSEC_PER_RAD
+    return km_each, d_ref / ARCSEC_PER_RAD
+
+
+def _sky_axes_labels(ax, parent="planet", in_km=True):
+    # Projected distance from the planet on the sky, along the RA (east)
+    # and Dec (north) directions. Each night is converted to km with that
+    # night's distance, so a change in distance does not change the size.
+    unit = "10$^3$ km" if in_km else "arcsec"
+    ax.set_xlabel(f"Distance east of {parent.capitalize()} ({unit})   ← east")
+    ax.set_ylabel(f"Distance north of {parent.capitalize()} ({unit})   north ↑")
     ax.invert_xaxis()      # east on the left, as on the sky
     ax.set_aspect("equal", adjustable="datalim")
     ax.grid(True, alpha=0.3)
@@ -867,12 +893,37 @@ def plot_moon_year(group, fit, moon, year, parent, origin, path):
     """2 x 2 figure: sky-plane orbit, separation, RA(t), Dec(t)."""
 
     t = group["t"].to_numpy()
-    xi = group["sky_x_arcsec"].to_numpy()
-    eta = group["sky_y_arcsec"].to_numpy()
-    sep = group["separation_arcsec"].to_numpy()
-    sxi = group["sigma_sky_x"].to_numpy()
-    seta = group["sigma_sky_y"].to_numpy()
-    ssep = group["error_arcsec"].to_numpy()
+
+    # Everything is plotted as distance (thousands of km), not angle: each
+    # image is converted with that night's planet distance, and the model
+    # with the reference distance the fit used.
+    km_each, km_ref = _km_scales(group, parent)
+    in_km = km_each is not None
+    if in_km:
+        each = km_each / 1e3
+        ref = km_ref / 1e3
+        unit, unit_short = "10$^3$ km", "×10$^3$ km"
+    else:
+        each = np.ones(len(group))
+        ref = 1.0
+        unit, unit_short = "arcsec", "″"
+
+    xi = group["sky_x_arcsec"].to_numpy(dtype=float) * each
+    eta = group["sky_y_arcsec"].to_numpy(dtype=float) * each
+    sep = group["separation_arcsec"].to_numpy(dtype=float) * each
+    sxi = group["sigma_sky_x"].to_numpy(dtype=float) * each
+    seta = group["sigma_sky_y"].to_numpy(dtype=float) * each
+    ssep = group["error_arcsec"].to_numpy(dtype=float) * each
+
+    ecc = fit.get("ecc") if fit is not None else None
+
+    def model_xy(tt):
+        mx, my = model_from_fit(fit, tt)
+        return mx * ref, my * ref
+
+    def ecc_xy(tt):
+        x, y, _ = ecc_xyz(ecc, tt)
+        return x * ref, y * ref
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 9.5))
     ax_sky, ax_sep, ax_xi, ax_eta = (
@@ -900,22 +951,20 @@ def plot_moon_year(group, fit, moon, year, parent, origin, path):
 
     if fit is not None:
         tt = np.linspace(0, fit["period"], 600)
-        ex, ey = model_from_fit(fit, tt)
+        ex, ey = model_xy(tt)
         ax_sky.plot(ex, ey, "--", color="tab:red", lw=1.2, label="Fitted orbit")
 
-        mx, my = model_from_fit(fit, t)
+        mx, my = model_xy(t)
         for x1, y1, x2, y2 in zip(xi, eta, mx, my):
             ax_sky.plot([x1, x2], [y1, y2], "-", color="tab:red", lw=0.8)
 
-    ecc = fit.get("ecc") if fit is not None else None
-
     if ecc is not None:
-        ex2, ey2, _ = ecc_xyz(ecc, np.linspace(0, ecc["period"], 600))
+        ex2, ey2 = ecc_xy(np.linspace(0, ecc["period"], 600))
         ax_sky.plot(ex2, ey2, "-", color="tab:orange", lw=1.4,
                     label=f"Eccentric fit (e = {ecc['e']:.3f})")
 
     ax_sky.set_title("Orbit on the sky (equal scale)")
-    _sky_axes_labels(ax_sky)
+    _sky_axes_labels(ax_sky, parent, in_km)
     ax_sky.legend(fontsize=8, loc="upper right")
 
     # ---- model time grid ------------------------------------
@@ -930,27 +979,27 @@ def plot_moon_year(group, fit, moon, year, parent, origin, path):
         label="Observed separation",
     )
     if fit is not None:
-        gx, gy = model_from_fit(fit, tg)
+        gx, gy = model_xy(tg)
         ax_sep.plot(tg, np.hypot(gx, gy), "-", color="tab:red", label="Model")
         ax_sep.axhline(
-            fit["a"], ls=":", color="k", lw=1,
-            label=f"a = {fit['a']:.1f}″ (max)",
+            fit["a"] * ref, ls=":", color="k", lw=1,
+            label=f"a = {fit['a'] * ref:,.1f} {unit_short} (max)",
         )
         ax_sep.axhline(
-            abs(fit["k"]) * fit["a"], ls=":", color="tab:blue", lw=1,
-            label=f"b = {abs(fit['k']) * fit['a']:.2f}″ (min)",
+            abs(fit["k"]) * fit["a"] * ref, ls=":", color="tab:blue", lw=1,
+            label=f"b = {abs(fit['k']) * fit['a'] * ref:,.1f} {unit_short} (min)",
         )
     ax_sep.set_title(f"Separation from {parent.capitalize()}")
     ax_sep.set_xlabel("Days since first image")
-    ax_sep.set_ylabel("Separation (arcsec)")
+    ax_sep.set_ylabel(f"Distance from {parent.capitalize()} on the sky ({unit})")
     ax_sep.set_ylim(bottom=0)
     ax_sep.grid(True, alpha=0.3)
     ax_sep.legend(fontsize=8)
 
     # ---- RA and Dec against time ----------------------------
     for ax, data, err, name, comp in (
-        (ax_xi, xi, sxi, "RA offset (arcsec, east +)", 0),
-        (ax_eta, eta, seta, "Dec offset (arcsec, north +)", 1),
+        (ax_xi, xi, sxi, f"Distance east of {parent.capitalize()} ({unit})", 0),
+        (ax_eta, eta, seta, f"Distance north of {parent.capitalize()} ({unit})", 1),
     ):
         ax.errorbar(
             t, data, yerr=bars(data, data, err), fmt="o", capsize=3,
@@ -958,13 +1007,13 @@ def plot_moon_year(group, fit, moon, year, parent, origin, path):
         )
         if fit is not None:
             ax.plot(
-                tg, model_from_fit(fit, tg)[comp], "-", color="tab:red",
+                tg, model_xy(tg)[comp], "-", color="tab:red",
                 label="Circular model",
             )
 
             if ecc is not None:
                 ax.plot(
-                    tg, ecc_xyz(ecc, tg)[comp], "-", color="tab:orange",
+                    tg, ecc_xy(tg)[comp], "-", color="tab:orange",
                     label="Eccentric model",
                 )
         ax.axhline(0, color="0.5", lw=0.8)
@@ -976,8 +1025,8 @@ def plot_moon_year(group, fit, moon, year, parent, origin, path):
     if fit is not None:
         tilt = np.degrees(np.arcsin(min(abs(fit["k"]), 1.0)))
         title = (
-            f"{moon.capitalize()} {year}:  a = {fit['a']:.2f} ± "
-            f"{fit['a_err']:.2f}″,  b/a = {abs(fit['k']):.3f} "
+            f"{moon.capitalize()} {year}:  a = {fit['a'] * ref:,.1f} ± "
+            f"{fit['a_err'] * ref:,.1f} {unit_short},  b/a = {abs(fit['k']):.3f} "
             f"(tilt {tilt:.1f}°),  P = {fit['period']:.4f} ± "
             f"{fit['period_err']:.4f} d ({fit['period_status']}, "
             f"{'with dz' if fit['used_dz'] else 'sky only'}),  "
@@ -989,7 +1038,9 @@ def plot_moon_year(group, fit, moon, year, parent, origin, path):
     fig.suptitle(title, fontsize=10)
     fig.text(
         0.5, 0.005,
-        f"Origin of time axis: {origin:%Y-%m-%d %H:%M}",
+        f"Origin of time axis: {origin:%Y-%m-%d %H:%M}.   Distances are projected "
+        f"on the sky (east = RA, north = Dec), each image converted with that "
+        f"night's distance to {parent.capitalize()}.   Error bars at true size.",
         ha="center", fontsize=8,
     )
     fig.tight_layout(rect=(0, 0.02, 1, 0.97))
@@ -1059,36 +1110,6 @@ def _error_note(ex, ey, ez):
         return ""
 
     return "Typical error bars: " + ", ".join(parts)
-
-
-def _magnification(error_arrays, radius):
-    """Round factor by which error bars are drawn larger than life."""
-
-    if ERRORBAR_MAGNIFY != "auto":
-        return max(float(ERRORBAR_MAGNIFY), 1.0)
-
-    values = [
-        v[np.isfinite(v) & (v > 0)] for v in error_arrays if v is not None
-    ]
-    values = [v for v in values if len(v)]
-
-    if not values:
-        return 1.0
-
-    typical = float(np.median(np.concatenate(values)))
-    wanted = 0.04 * radius / typical
-
-    for nice in (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000):
-        if nice >= wanted:
-            return float(nice)
-
-    return 1000.0
-
-
-def _magnify_text(factor):
-    if factor <= 1:
-        return "Error bars at true size."
-    return f"Error bars drawn x{factor:g} so they can be seen."
 
 
 def plot_residuals(group, fit, moon, year, parent, path):
@@ -1338,8 +1359,6 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
     errors = _errors_km(group, parent)
     err_x, err_y, err_z = errors if errors is not None else (None, None, None)
     bx, by, bz = _bars(err_x), _bars(err_y), _bars(err_z)
-    magnify = _magnification([err_x, err_y, err_z], radius)
-    bx, by, bz = [None if b is None else b * magnify for b in (bx, by, bz)]
 
     # ---- 3D ----
     if bx is not None or by is not None or bz is not None:
@@ -1425,7 +1444,7 @@ def plot_orbit_3d(group, fit, moon, year, parent, origin, path):
 
     note = _error_note(err_x, err_y, err_z)
     if note:
-        fig.text(0.5, 0.008, note + ".  " + _magnify_text(magnify),
+        fig.text(0.5, 0.008, note + ".  Error bars at true size.",
                  ha="center", va="bottom", fontsize=8, color="0.3")
 
     title = f"{moon.capitalize()} {year}: orbit around {parent.capitalize()}"
@@ -1585,12 +1604,6 @@ def plot_system_3d(groups, fits, parent, year, path):
         )
 
     all_sky_errors = []
-    every_error = []
-    for moon in pieces:
-        errors = _errors_km(groups[moon], parent)
-        if errors is not None:
-            every_error += list(errors)
-    magnify = _magnification(every_error, radius)
 
     for colour, (moon, geom) in zip(colours, pieces.items()):
         obs_x, obs_y, obs_z, _, curve, _, ecc_c = geom
@@ -1598,7 +1611,6 @@ def plot_system_3d(groups, fits, parent, year, path):
         errors = _errors_km(groups[moon], parent)
         err_x, err_y, err_z = errors if errors is not None else (None, None, None)
         bx, by, bz = _bars(err_x), _bars(err_y), _bars(err_z)
-        bx, by, bz = [None if b is None else b * magnify for b in (bx, by, bz)]
         for values in (err_x, err_y):
             if values is not None and np.isfinite(values).any():
                 all_sky_errors.append(values[np.isfinite(values)])
@@ -1703,7 +1715,7 @@ def plot_system_3d(groups, fits, parent, year, path):
         typical = float(np.median(np.concatenate(all_sky_errors)))
         lines.append("")
         lines.append(f"Error bars: east/north typically ±{typical:,.0f} km")
-        lines.append("            " + _magnify_text(magnify))
+        lines.append("            (drawn at true size)")
         lines.append(
             f"            depth ±{float(DZ_ERROR_KM):,.0f} km" if DZ_ERROR_KM is not None
             else "            depth from ephemeris (no measured error)"
@@ -1958,12 +1970,23 @@ def plot_system_view(year_df, fits, parent, year, path):
     ax.plot(0, 0, "o", color="gold", mec="k", ms=14, zorder=5,
             label=parent.capitalize())
 
+    # Distance (thousands of km), each image converted with that night's
+    # planet distance and each model with its fit's reference distance.
+    # Error bars at true size.
+    in_km = True
     for colour, moon in zip(colours, moons):
         g = year_df.loc[year_df["moon"] == moon]
+        km_each, km_ref = _km_scales(g, parent)
+        if km_each is None:
+            in_km = False
+            each, ref = np.ones(len(g)), 1.0
+        else:
+            each, ref = km_each / 1e3, km_ref / 1e3
         sx, sy = sky_errors(g)
         ax.errorbar(
-            g["sky_x_arcsec"], g["sky_y_arcsec"],
-            xerr=_bars(sx), yerr=_bars(sy),
+            g["sky_x_arcsec"].to_numpy(dtype=float) * each,
+            g["sky_y_arcsec"].to_numpy(dtype=float) * each,
+            xerr=_bars(sx * each), yerr=_bars(sy * each),
             fmt="o", color=colour, ecolor=colour, elinewidth=0.9, capsize=2,
             ms=5, label=moon.capitalize(), zorder=4,
         )
@@ -1972,10 +1995,10 @@ def plot_system_view(year_df, fits, parent, year, path):
         if fit is not None:
             tt = np.linspace(0, fit["period"], 600)
             ex, ey = model_from_fit(fit, tt)
-            ax.plot(ex, ey, "--", color=colour, lw=1)
+            ax.plot(ex * ref, ey * ref, "--", color=colour, lw=1)
 
-    ax.set_title(f"{parent.capitalize()} system on the sky, {year}")
-    _sky_axes_labels(ax)
+    ax.set_title(f"{parent.capitalize()} system on the sky, {year}", fontsize=11)
+    _sky_axes_labels(ax, parent, in_km)
     ax.legend(fontsize=8, ncol=2)
     fig.tight_layout()
     fig.savefig(path, dpi=160)
