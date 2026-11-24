@@ -101,6 +101,7 @@ PARENT_BODY = {
     "tethys": "saturn",
     "dione": "saturn",
     "enceladus": "saturn",
+    "iapetus": "saturn",
     "triton": "neptune",
 }
 
@@ -121,7 +122,7 @@ VISIT_GAP_MINUTES = 30.0
 # leaves almost no redundancy: with a free period the fit then simply picks
 # whichever period matches, and the answer is not trustworthy. 6 visits
 # (7 degrees of freedom) is the smallest number that gives a meaningful test.
-MIN_VISITS_FOR_FIT = 6
+MIN_VISITS_FOR_FIT = 4
 
 # With dz as a third coordinate each visit gives 3 numbers, so fewer visits
 # are enough (6 linear parameters + period = 7 unknowns; 4 visits = 12 numbers).

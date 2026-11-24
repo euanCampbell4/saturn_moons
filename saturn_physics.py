@@ -79,6 +79,7 @@ LIT_ORBITS = {
     "dione": (377400.0, 2.736916),
     "rhea": (527070.0, 4.517503),
     "titan": (1221865.0, 15.945448),
+    "iapetus": (3560820.0, 79.3215),
     "triton": (354759.0, 5.876854),
 }
 LIT_TITAN_E = 0.0288
@@ -86,14 +87,15 @@ LIT_TITAN_E = 0.0288
 # moon masses (kg), used only for the small correction G(M+m) -> GM
 MOON_MASS_KG = {
     "enceladus": 1.0802e20, "tethys": 6.1745e20, "dione": 1.0955e21,
-    "rhea": 2.3065e21, "titan": 1.3452e23, "triton": 2.139e22,
+    "rhea": 2.3065e21, "titan": 1.3452e23, "iapetus": 1.8056e21,
+    "triton": 2.139e22,
 }
 
 # mean densities (kg/m^3) for the per-moon Roche limit; ice for ring particles
 MOON_DENSITY = {
     "water ice (ring particles)": 920.0,
     "enceladus": 1609.0, "tethys": 984.0, "dione": 1478.0,
-    "rhea": 1236.0, "titan": 1881.0,
+    "rhea": 1236.0, "titan": 1881.0, "iapetus": 1088.0,
 }
 
 # edges of Saturn's main rings (km from the centre), PDS Rings Node
@@ -101,7 +103,7 @@ A_RING_OUTER_KM = 136770.0
 F_RING_KM = 140224.0
 
 PARENT = {m: "saturn" for m in
-          ("mimas", "enceladus", "tethys", "dione", "rhea", "titan")}
+          ("mimas", "enceladus", "tethys", "dione", "rhea", "titan", "iapetus")}
 PARENT["triton"] = "neptune"
 
 

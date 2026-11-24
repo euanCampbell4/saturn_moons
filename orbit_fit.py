@@ -92,6 +92,10 @@ MIN_NIGHTS_FOR_RELIABLE_FIT = 3
 # Period search (no assumed period).
 MIN_PERIOD_DAYS = 0.5
 MAX_PERIOD_SPAN_FACTOR = 3.0
+# Longest period searched for a particular moon, in days, when that is longer
+# than MAX_PERIOD_SPAN_FACTOR x the observing span. Iapetus takes 79 days, so
+# a term of data covers only part of one orbit; let the search reach it.
+MAX_PERIOD_DAYS = {"iapetus": 120.0}
 SCAN_OVERSAMPLE = 400        # fine, because well-measured data has narrow dips
 N_CANDIDATES = 6             # best periods refined with the full model
 ALIAS_DELTA_CHI2 = 9.0       # alternatives within this (in noise units) are "not ruled out"
@@ -355,14 +359,16 @@ def _linear_chi2(t, frequency, series, weights):
     return total
 
 
-def candidate_periods(t, series, weights):
+def candidate_periods(t, series, weights, p_max=None):
     """
     Scan every trial period and return the best distinct candidates
     (periods in days), refined, best first.
     """
 
     span = float(np.ptp(t))
-    f_min = 1.0 / (MAX_PERIOD_SPAN_FACTOR * span)
+    if p_max is None:
+        p_max = MAX_PERIOD_SPAN_FACTOR * span
+    f_min = 1.0 / p_max
     f_max = 1.0 / MIN_PERIOD_DAYS
     step = 1.0 / (SCAN_OVERSAMPLE * span)
 
@@ -452,7 +458,7 @@ def _dz_sign(t, z, a, k, period, phase):
     return 1.0 if agreement >= 0 else -1.0
 
 
-def fit_orbit(vis, required_pole=None):
+def fit_orbit(vis, required_pole=None, moon=None):
     """
     Weighted least-squares fit of the projected ellipse to the visits.
 
@@ -498,7 +504,9 @@ def fit_orbit(vis, required_pole=None):
     # ---- period search: every period, nothing assumed -------------------
     series = [xi, eta] + ([z] if use_z else [])
     weights = [wx ** 2, wy ** 2] + ([wz ** 2] if use_z else [])
-    periods = candidate_periods(t, series, weights)
+    span_days = float(np.ptp(t))
+    p_max = max(MAX_PERIOD_SPAN_FACTOR * span_days, MAX_PERIOD_DAYS.get(moon, 0.0))
+    periods = candidate_periods(t, series, weights, p_max)
 
     if not periods:
         return None
@@ -522,7 +530,7 @@ def fit_orbit(vis, required_pole=None):
 
     span = float(np.ptp(t))
     p_lo = MIN_PERIOD_DAYS * 0.9
-    p_hi = MAX_PERIOD_SPAN_FACTOR * span * 1.1
+    p_hi = p_max * 1.1
 
     def unpack(p):
         if FIT_CENTRE_OFFSET:
@@ -2126,7 +2134,7 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                 (group["datetime"] - origin).dt.total_seconds() / 86400.0
             )
             visits = combine_visits(group)
-            prepared[moon] = (group, visits, fit_orbit(visits))
+            prepared[moon] = (group, visits, fit_orbit(visits, moon=moon))
 
         # Second pass: all moons of one planet must orbit the same way.
         direction_notes = {moon: "not checked" for moon in prepared}
@@ -2146,7 +2154,7 @@ def fit_and_plot_orbits(df, out_dir, initial_periods=None, parent_body=None):
                     direction_notes[moon] = "agrees with the other moons"
                 elif verdict is False:
                     old_period = fit["period"]
-                    corrected = fit_orbit(visits, required_pole=reference)
+                    corrected = fit_orbit(visits, required_pole=reference, moon=moon)
 
                     if corrected is not None:
                         prepared[moon] = (group, visits, corrected)
