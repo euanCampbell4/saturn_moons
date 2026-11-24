@@ -7,49 +7,49 @@ SATURN
 
 Per-moon Kepler III (GM in km^3/s^2):
 moon      year        a (km)     P (d)              GM  error %  vs lit %  sigma  fit
-dione     2026       374,515    2.7358      37,116,134     3.65     -2.15   -0.6  circular
-enceladus 2026       235,468    1.3686      36,860,076     7.43     -2.82   -0.4  circular
-rhea      2026       526,668    4.5143      37,910,604     2.42     -0.05   -0.0  circular
-tethys    2026       295,546    1.8876      38,316,288     5.30     +1.02   +0.2  circular
-titan     2026     1,228,866   15.8977      38,821,781     1.39     +2.35   +1.7  eccentric (e=0.040)
+dione     2026       375,169    2.7357      37,313,536     3.39     -1.63   -0.5  circular
+enceladus 2026       236,150    1.3690      37,161,749     7.52     -2.03   -0.3  circular
+rhea      2026       526,804    4.5142      37,941,797     2.37     +0.03   +0.0  circular
+tethys    2026       295,819    1.8876      38,421,959     4.53     +1.29   +0.3  circular
+titan     2026     1,228,792   15.8998      38,804,740     1.31     +2.30   +1.7  eccentric (e=0.038)
 
 Combined (5 fits, weighted mean):
-  GM   = 38,389,472 +/- 424,405 km^3/s^2   (published 37,931,182;  +1.21%, +1.1 sigma)
-  Mass = (5.7518e+26 +/- 6.4e+24) kg   (published 5.68317e+26 kg)
-  Consistency between moons: chi2 = 2.1 for 4 dof  (Birge ratio 0.73; moons agree within errors)
+  GM   = 38,428,643 +/- 401,153 km^3/s^2   (published 37,931,182;  +1.31%, +1.2 sigma)
+  Mass = (5.7577e+26 +/- 6.0e+24) kg   (published 5.68317e+26 kg)
+  Consistency between moons: chi2 = 1.8 for 4 dof  (Birge ratio 0.68; moons agree within errors)
 
 Kepler's third law test: a ~ P^alpha
-  alpha = 0.6728 +/- 0.0047   (Kepler: 2/3 = 0.6667; +1.3 sigma)
+  alpha = 0.6719 +/- 0.0044   (Kepler: 2/3 = 0.6667; +1.2 sigma)
 
 Mean density (from the measured mass and the published volumetric mean radius 58,232 km):
-  rho = 695 +/- 8 kg/m^3   (published 687; +1.2%)
+  rho = 696 +/- 7 kg/m^3   (published 687; +1.3%)
 
 Roche limit  d = k * R * (rho_planet / rho_satellite)^(1/3)   with R = equatorial radius
   fluid body k = 2.44, rigid body k = 1.26.  Uncertainty comes from the mass only.
 satellite                       rho   fluid (km)  rigid (km)   in R_Saturn (fluid)
-water ice (ring particles)      920      133,955      69,173   2.22  (+/- 494 km)
-enceladus                      1609      111,182      57,414   1.84  (+/- 410 km)
-tethys                          984      130,985      67,640   2.17  (+/- 483 km)
-dione                          1478      114,375      59,062   1.90  (+/- 421 km)
-rhea                           1236      121,399      62,690   2.01  (+/- 447 km)
-titan                          1881      105,542      54,501   1.75  (+/- 389 km)
+water ice (ring particles)      920      134,000      69,197   2.22  (+/- 466 km)
+enceladus                      1609      111,220      57,433   1.85  (+/- 387 km)
+tethys                          984      131,030      67,663   2.17  (+/- 456 km)
+dione                          1478      114,413      59,082   1.90  (+/- 398 km)
+rhea                           1236      121,440      62,711   2.02  (+/- 423 km)
+titan                          1881      105,578      54,520   1.75  (+/- 367 km)
 
-  For ice, fluid Roche limit 133,955 km = 2.22 R_Saturn.  Published: A ring outer edge 136,770 km, F ring 140,224 km; the F ring is +4.7% from this limit.
+  For ice, fluid Roche limit 134,000 km = 2.22 R_Saturn.  Published: A ring outer edge 136,770 km, F ring 140,224 km; the F ring is +4.6% from this limit.
 
 Measured orbit sizes in Saturn radii, against the fluid Roche limit for ice:
-  dione     2026: a =   6.21 R_Saturn   ( 2.80 x Roche limit)
-  enceladus 2026: a =   3.91 R_Saturn   ( 1.76 x Roche limit)
+  dione     2026: a =   6.23 R_Saturn   ( 2.80 x Roche limit)
+  enceladus 2026: a =   3.92 R_Saturn   ( 1.76 x Roche limit)
   rhea      2026: a =   8.74 R_Saturn   ( 3.93 x Roche limit)
-  tethys    2026: a =   4.90 R_Saturn   ( 2.21 x Roche limit)
+  tethys    2026: a =   4.91 R_Saturn   ( 2.21 x Roche limit)
   titan     2026: a =  20.39 R_Saturn   ( 9.17 x Roche limit)
 
 Orbit sizes and periods against published values:
 moon      year        a (km)   published  diff %     P (d)  published  diff %
-dione     2026       374,515     377,400   -0.76    2.7358     2.7369   -0.04
-enceladus 2026       235,468     238,037   -1.08    1.3686     1.3702   -0.12
-rhea      2026       526,668     527,070   -0.08    4.5143     4.5175   -0.07
-tethys    2026       295,546     294,672   +0.30    1.8876     1.8878   -0.01
-titan     2026     1,228,866   1,221,865   +0.57   15.8977    15.9454   -0.30
+dione     2026       375,169     377,400   -0.59    2.7357     2.7369   -0.04
+enceladus 2026       236,150     238,037   -0.79    1.3690     1.3702   -0.09
+rhea      2026       526,804     527,070   -0.05    4.5142     4.5175   -0.07
+tethys    2026       295,819     294,672   +0.39    1.8876     1.8878   -0.01
+titan     2026     1,228,792   1,221,865   +0.57   15.8998    15.9454   -0.29
 
 ======================================================================
 NEPTUNE
@@ -57,23 +57,23 @@ NEPTUNE
 
 Per-moon Kepler III (GM in km^3/s^2):
 moon      year        a (km)     P (d)              GM  error %  vs lit %  sigma  fit
-triton    2026       360,027    5.8708       7,159,126     5.77     +4.74   +0.8  circular
+triton    2026       358,030    5.8683       7,046,655     5.49     +3.09   +0.5  circular
 
 Combined (1 fits, weighted mean):
-  GM   = 7,159,126 +/- 412,884 km^3/s^2   (published 6,835,351;  +4.74%, +0.8 sigma)
-  Mass = (1.0726e+26 +/- 6.2e+24) kg   (published 1.02413e+26 kg)
+  GM   = 7,046,655 +/- 386,821 km^3/s^2   (published 6,835,351;  +3.09%, +0.5 sigma)
+  Mass = (1.0558e+26 +/- 5.8e+24) kg   (published 1.02413e+26 kg)
 
 Kepler's law exponent: need at least 3 different moons.
 
 Mean density (from the measured mass and the published volumetric mean radius 24,622 km):
-  rho = 1716 +/- 99 kg/m^3   (published 1638; +4.7%)
+  rho = 1689 +/- 93 kg/m^3   (published 1638; +3.1%)
 
 Orbit sizes and periods against published values:
 moon      year        a (km)   published  diff %     P (d)  published  diff %
-triton    2026       360,027     354,759   +1.49    5.8708     5.8769   -0.10
+triton    2026       358,030     354,759   +0.92    5.8683     5.8769   -0.15
 
 ======================================================================
 TITAN ECCENTRICITY
 ======================================================================
-  2026: e = 0.0404 +/- 0.0092   (published 0.0288; +1.3 sigma; F-test vs circular p = 1e-05)
+  2026: e = 0.0382 +/- 0.0087   (published 0.0288; +1.1 sigma; F-test vs circular p = 7.9e-06)
   Caution: the depth values (dz) come from an ephemeris, so this is a consistency check, not an independent measurement.
